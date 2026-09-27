@@ -1,0 +1,33 @@
+{
+	"name": "fnx-bus",
+	"version": "0.1.0",
+	"private": true,
+	"description": "多 agent 消息总线：结构化契约校验 + 授权闸门 + 文件队列。一个 pi 扩展，可装可不装，与各 agent 源码解耦。",
+	"type": "module",
+	"license": "UNLICENSED",
+	"files": [
+		"extensions",
+		"README.md"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/fnxbus"
+		]
+	},
+	"scripts": {
+		"test": "vitest --run",
+		"typecheck": "tsgo --noEmit",
+		"check": "biome check --write --error-on-warnings . && tsgo --noEmit && vitest --run"
+	},
+	"dependencies": {
+		"typebox": "1.1.38"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.3.5",
+		"@earendil-works/pi-coding-agent": "0.79.10",
+		"@types/node": "22.19.19",
+		"@typescript/native-preview": "7.0.0-dev.20260120.1",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	}
+}
