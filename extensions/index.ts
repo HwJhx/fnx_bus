@@ -99,6 +99,11 @@ export default function fnxbus(pi: ExtensionAPI) {
 	let sentIds = new Set<string>();
 	let watcher: FSWatcher | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
+	/**
+	 * 会话上下文。`drain` 是被 watcher 和定时器调的，拿不到事件参数里的 ctx，
+	 * 但它需要 `isIdle()` 判断现在能不能处理消息（见 drain 开头）。
+	 */
+	let sessionCtx: ExtensionContext | undefined;
 	/** 初始化失败的原因。失败时扩展不工作，但要让人看得见，不能静默。 */
 	let initError = "";
 	let draining = false;
@@ -203,6 +208,21 @@ export default function fnxbus(pi: ExtensionAPI) {
 
 	function drain(): void {
 		if (draining || initError.length > 0) return;
+		/**
+		 * agent 正在干活时不处理消息。**这是修一个因果错位的 bug，不是性能优化。**
+		 *
+		 * 注入用的是 `deliverAs: "followUp"`，pi 的语义是「等 agent 没有待跑的工具调用了才投递」
+		 * ——消息本来就插不进正在跑的那一轮。但下面的 `guard.gated = true` 是**同步立刻**生效的，
+		 * 于是出现这种局面：一个长流程（比如 sw-graph 全量）跑到一半，轮询触发 drain，
+		 * 闸门当场关上，而那条消息还在队列里排队等流程结束——
+		 * **流程剩下的工具调用全部被一条还没投递、LLM 还没看到的消息拦住**。
+		 *
+		 * 交互模式下表现为弹框问人，`-p` 模式下 `decideToolCall` 直接 block，流程崩在半路。
+		 *
+		 * 所以这里等 agent 空下来再处理。消息留在 inbox，下一次轮询（5 秒）再试；
+		 * 真到进程退出还没处理，那就是离线补投那条路，下次启动接着来——都是现成机制。
+		 */
+		if (sessionCtx !== undefined && !sessionCtx.isIdle()) return;
 		draining = true;
 		try {
 			for (const item of listInbox(projectRoot, agent)) {
@@ -274,6 +294,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		sessionCtx = ctx;
 		agent = process.env.FNXBUS_AGENT ?? process.env.FORENYX_AGENT_NAME ?? "";
 		if (agent.length === 0) {
 			failInit(ctx, "未能确定本端角色名。请设 FNXBUS_AGENT=<角色名>，要和 roles.json 里的键一致。");
