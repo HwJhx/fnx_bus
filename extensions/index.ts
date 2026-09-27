@@ -31,7 +31,7 @@
  */
 
 import { existsSync, type FSWatcher, mkdirSync, readFileSync, renameSync, watch } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CONTRACT, PROTO, parseMessage } from "./contract.ts";
@@ -45,6 +45,7 @@ import {
 	appendSent,
 	BusRootNotFound,
 	busDir,
+	findInitializedRoot,
 	fingerprint,
 	gitRoot,
 	listInbox,
@@ -837,17 +838,31 @@ export default function fnxbus(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const templatePath = /--from\s+(\S+)/.exec(args)?.[1];
 
-			// 项目根：给候选让人选，而不是直接用某一个
+			// 项目根：给候选让人选，而不是直接用某一个。
+			// 顺序按「多半是对的」排：已初始化的 > 上一层（agent 通常在项目根的子目录里跑）
+			// > 当前目录 > git 根。
 			const here = resolve(ctx.cwd);
+			const parent = dirname(here);
+			const initialized = findInitializedRoot(ctx.cwd);
 			const git = gitRoot(ctx.cwd);
-			const candidates = [here];
-			if (git !== undefined && git !== here) candidates.push(git);
+			const candidates: { path: string; label: string }[] = [];
+			const addCandidate = (path: string | undefined, label: string) => {
+				if (path === undefined) return;
+				if (candidates.some((c) => c.path === path)) return;
+				candidates.push({ path, label });
+			};
+			addCandidate(initialized, "已经初始化过，别的 agent 多半用的就是它");
+			addCandidate(parent === here ? undefined : parent, "上一层");
+			addCandidate(here, "当前目录");
+			addCandidate(git, "git 仓库根");
+
 			const pickOther = "自己输入路径";
+			const options = [...candidates.map((c) => `${c.path}（${c.label}）`), pickOther];
 			const picked = await ctx.ui.select(
 				["项目根定在哪？两个 agent 必须选同一个，否则互相收不到消息。", "", "（这是唯一需要你确认的事）"].join(
 					"\n",
 				),
-				[...candidates.map((c) => (c === here ? `${c}（当前目录）` : `${c}（git 仓库根）`)), pickOther],
+				options,
 			);
 			if (picked === undefined) return;
 			let projectDir: string;
@@ -856,7 +871,10 @@ export default function fnxbus(pi: ExtensionAPI) {
 				if (typed === undefined || typed.trim().length === 0) return;
 				projectDir = resolve(typed.trim());
 			} else {
-				projectDir = picked.replace(/（.*）$/, "");
+				// 从选项文本反查回路径，别用正则剥括号——路径本身可能带括号
+				const hit = candidates.find((c) => `${c.path}（${c.label}）` === picked);
+				if (hit === undefined) return;
+				projectDir = hit.path;
 			}
 			if (!existsSync(projectDir)) {
 				ctx.ui.notify(`目录不存在：${projectDir}`, "error");

@@ -128,6 +128,24 @@ export function resolveProjectRoot(cwd: string, env: Record<string, string | und
 	);
 }
 
+/**
+ * 向上找一个**已经初始化过**的项目根（有 `.fnxbus/project.json` 的那个）。
+ *
+ * `/bus-setup` 用它给候选排序：第二个 agent 来初始化时，第一个建好的项目根该排最前面 ——
+ * 否则人得手打一遍路径，而打错的后果就是两个 agent 各用一个目录、互相收不到消息。
+ *
+ * 找不到返回 undefined（新项目的正常情况）。
+ */
+export function findInitializedRoot(cwd: string): string | undefined {
+	let dir = resolve(cwd);
+	for (;;) {
+		if (existsSync(join(dir, BUS_DIR, "project.json"))) return dir;
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
 export function busDir(projectRoot: string): string {
 	return join(projectRoot, BUS_DIR);
 }

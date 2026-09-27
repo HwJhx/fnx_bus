@@ -8,6 +8,7 @@ import {
 	appendSent,
 	BusRootNotFound,
 	busDir,
+	findInitializedRoot,
 	fingerprint,
 	listInbox,
 	loadSeen,
@@ -328,5 +329,34 @@ describe("单实例锁", () => {
 		releaseLock(root, "fnx_dv");
 		writeFileSync(join(busDir(root), "locks", "fnx_dv.lock"), "1");
 		expect(acquireLock(root, "fnx_dv")).toBe(1);
+	});
+});
+
+describe("findInitializedRoot（/bus-setup 用它给候选排序）", () => {
+	it("找得到最近的那个已初始化的祖先", () => {
+		const inner = join(root, "a", "b");
+		mkdirSync(join(inner, "sw"), { recursive: true });
+		mkdirSync(join(root, ".fnxbus"), { recursive: true });
+		writeFileSync(join(root, ".fnxbus", "project.json"), "{}");
+		mkdirSync(join(inner, ".fnxbus"), { recursive: true });
+		writeFileSync(join(inner, ".fnxbus", "project.json"), "{}");
+		expect(findInitializedRoot(join(inner, "sw"))).toBe(inner);
+	});
+
+	it("从子目录往上找得到（第二个 agent 的场景）", () => {
+		mkdirSync(join(root, ".fnxbus"), { recursive: true });
+		writeFileSync(join(root, ".fnxbus", "project.json"), "{}");
+		mkdirSync(join(root, "dv"), { recursive: true });
+		expect(findInitializedRoot(join(root, "dv"))).toBe(root);
+	});
+
+	it("没初始化过就返回 undefined（新项目的正常情况）", () => {
+		mkdirSync(join(root, "sw"), { recursive: true });
+		expect(findInitializedRoot(join(root, "sw"))).toBeUndefined();
+	});
+
+	it("只有目录没有 project.json 不算初始化过", () => {
+		mkdirSync(join(root, ".fnxbus"), { recursive: true });
+		expect(findInitializedRoot(root)).toBeUndefined();
 	});
 });
