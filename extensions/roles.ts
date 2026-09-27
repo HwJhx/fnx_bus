@@ -194,18 +194,20 @@ export function mergeRoles(
 
 export function rolesTemplate(agent: string, rolesPath: string): string {
 	return [
-		`${rolesPath} 该长这样（文件不存在就照着建；已存在就把 "${agent}" 那段加进 "roles" 里）：`,
+		"跑 /bus-setup 可以自动建好（有标准角色表的话用 /bus-setup --from <模板路径>）。",
+		"",
+		`要手写的话，${rolesPath} 该长这样（文件不存在就照着建；已存在就把 "${agent}" 那段加进 "roles" 里）：`,
 		"",
 		"  {",
 		'    "roles": {',
 		`      "${agent}": {`,
 		'        "subscribe": ["<这个角色要处理的消息类型>"],',
-		'        "owns": ["<这个角色可写的目录>/**"]',
+		'        "owns": ["<这个角色的产出放在哪>/**"]',
 		"      }",
 		"    }",
 		"  }",
 		"",
 		"subscribe 决定它能收到哪些扇出消息（指名发给它的一律能收到）；",
-		"owns 是它可写的路径，相对项目根，不要和别的角色重叠。",
+		"owns 声明它的产出放在哪，只用来标注，不限制它能读写什么。",
 	].join("\n");
 }

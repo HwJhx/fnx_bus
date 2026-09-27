@@ -121,8 +121,9 @@ export function resolveProjectRoot(cwd: string, env: Record<string, string | und
 			"无法确定项目根，拒绝注册。",
 			`  当前目录：${cwd}`,
 			`  已向上查找 ${join(BUS_DIR, "project.json")} 与 .git，均未找到。`,
-			"  请显式指定：FNXBUS_PROJECT=<项目根路径>",
-			"  或在项目根执行：mkdir -p .fnxbus && echo '{}' > .fnxbus/project.json",
+			"",
+			"  跑 /bus-setup 初始化这个项目（它会问你项目根定在哪）。",
+			"  或者用 FNXBUS_PROJECT=<项目根路径> 指定一个已经初始化过的项目根。",
 		].join("\n"),
 	);
 }
