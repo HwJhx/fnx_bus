@@ -205,13 +205,31 @@ describe("decide", () => {
 		expect(d.reasons.some((r) => r.includes("不存在"))).toBe(true);
 	});
 
-	it("引用了不属于发送方的文件 → reject（文件归属）", () => {
+	it("引用了别人的文件 → 照常投递，只标注（「指着对方的文件说这行有问题」是正常协作）", () => {
 		const raw = validRaw({
-			files: [{ role: "spec", path: "software/lib/crc/src/crc.c", sha256: SHA_SPEC }],
+			files: [{ role: "spec", path: "other/place/thing.c", sha256: SHA_SPEC }],
 		});
 		const d = decide(parseMessage(raw), ctx({ shaOf: () => SHA_SPEC }));
-		expect(d.action).toBe("reject");
-		expect(d.reasons.some((r) => r.includes("owns 范围"))).toBe(true);
+		expect(d.action).toBe("inject");
+		expect(d.foreignPaths).toEqual(["other/place/thing.c"]);
+		expect(d.warnings.some((w) => w.includes("引用的是别人的文件"))).toBe(true);
+	});
+
+	it("没声明 owns 时不做这个标注", () => {
+		const raw = validRaw({
+			files: [{ role: "spec", path: "anywhere/thing.c", sha256: SHA_SPEC }],
+		});
+		const d = decide(parseMessage(raw), ctx({ senderOwns: [], shaOf: () => SHA_SPEC }));
+		expect(d.action).toBe("inject");
+		expect(d.foreignPaths).toEqual([]);
+	});
+
+	it("标注会摆到 LLM 面前，不只是进日志", () => {
+		const r = parseMessage(validRaw({ files: [{ role: "spec", path: "other/x.c", sha256: SHA_SPEC }] }));
+		expect(r.ok).toBe(true);
+		if (!r.ok) return;
+		const out = renderInjection(r.message, "PASS", false, ["other/x.c"]);
+		expect(out).toContain("不是它自己的产出");
 	});
 
 	it("reply_to 指向本机没发过的 id → 标可疑（E8 在没有 daemon 前唯一的补偿手段）", () => {

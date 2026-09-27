@@ -1,17 +1,40 @@
 {
 	"name": "fnx-bus",
 	"version": "0.1.0",
-	"private": true,
 	"description": "多 agent 消息总线：结构化契约校验 + 授权闸门 + 文件队列。一个 pi 扩展，可装可不装，与各 agent 源码解耦。",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi-skill",
+		"agent",
+		"multi-agent",
+		"agent-to-agent",
+		"message-bus",
+		"authorization-gate"
+	],
 	"type": "module",
-	"license": "UNLICENSED",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/HwJhx/fnx_bus.git"
+	},
+	"homepage": "https://github.com/HwJhx/fnx_bus#readme",
+	"bugs": {
+		"url": "https://github.com/HwJhx/fnx_bus/issues"
+	},
 	"files": [
 		"extensions",
+		"skills",
+		"roles.example.json",
+		"LICENSE",
 		"README.md"
 	],
 	"pi": {
 		"extensions": [
 			"./extensions"
+		],
+		"skills": [
+			"./skills"
 		]
 	},
 	"scripts": {

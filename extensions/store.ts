@@ -72,9 +72,9 @@ export class BusRootNotFound extends Error {}
 /**
  * 总线状态目录名。
  *
- * **刻意不用任何 agent 的 `piConfig.configDir`**（`.forenyx` 之类）。
+ * **刻意不用任何 agent 的 `piConfig.configDir`**。
  * 那个值是每个 agent 自己定的：两个 agent 的 configDir 不一致时，它们会各找一个 bus 目录、
- * 谁也收不到谁的消息，而且不报错——是最难查的那种故障。现在两个 agent 恰好都是 `.forenyx`，
+ * 谁也收不到谁的消息，而且不报错——是最难查的那种故障。同一批 agent 的 configDir 眼下可能一致，
  * 但那是巧合，不是保证。
  *
  * 用一个与 agent 配置无关的固定名，总线的状态目录就只由**项目**决定，不由装了哪个 agent 决定。

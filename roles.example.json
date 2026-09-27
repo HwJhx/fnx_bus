@@ -1,0 +1,13 @@
+{
+	"roles": {
+		"agent-a": {
+			"subscribe": ["work_done"],
+			"owns": ["a/**"]
+		},
+		"agent-b": {
+			"subscribe": ["review_failed", "need_input"],
+			"owns": ["b/**", "shared/docs/**"]
+		}
+	},
+	"readonlyTools": []
+}

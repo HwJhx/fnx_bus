@@ -25,18 +25,19 @@
  * 用法：
  *   pi -e ./packages/coding-agent/examples/extensions/fnxbus/index.ts
  * 环境变量：
- *   FNXBUS_AGENT    本端角色名，缺省取 FORENYX_AGENT_NAME
+ *   FNXBUS_AGENT    本端角色名（要和 roles.json 里的键一致）。
+ *                   没设时退而读宿主 agent 自己的名字（FORENYX_AGENT_NAME）
  *   FNXBUS_PROJECT  项目根，缺省按 store.ts 的 resolveProjectRoot 查找
  */
 
 import { existsSync, type FSWatcher, mkdirSync, readFileSync, renameSync, watch } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CONTRACT, PROTO, parseMessage } from "./contract.ts";
 import { decide, type GateContext, globMatch, renderInjection } from "./gate.ts";
 import { classifyToolCall, decideToolCall, freshGuardState } from "./guard.ts";
-import { findOwnsOverlaps, parseRolesFile, type Role, rolesTemplate, validateAgentName } from "./roles.ts";
+import { findOwnsOverlaps, mergeRoles, parseRolesFile, type Role, rolesTemplate, validateAgentName } from "./roles.ts";
 import {
 	acquireLock,
 	appendLog,
@@ -45,6 +46,7 @@ import {
 	BusRootNotFound,
 	busDir,
 	fingerprint,
+	gitRoot,
 	listInbox,
 	loadSeen,
 	loadSentIds,
@@ -58,27 +60,9 @@ import {
 	type SeenIndex,
 	shaOf,
 	shaOfOrThrow,
+	writeAtomic,
 	writeCard,
 } from "./store.ts";
-
-/**
- * 兜底角色表，对应设计 13.1。项目里放 `<项目根>/.fnxbus/roles.json` 就能覆盖它，
- * 加角色也只改那个文件——**代码里除了这张兜底表，没有任何地方写死角色名**
- * （路由、扇出、单实例锁、inbox/seen/sent 目录全按角色表的键来）。
- *
- * `owns` 一律相对项目根（4.3.2）：项目根共享只读，每个 agent 只写自己那个目录。
- * 阶段一实测 4.5 的「越界写」就是这条没定清的后果。
- */
-const DEFAULT_ROLES: Record<string, Role> = {
-	fnx_sw: {
-		subscribe: ["ip_verified", "spec_updated"],
-		owns: ["sw/**", "software/**"],
-	},
-	fnx_dv: {
-		subscribe: ["build_failed", "need_input"],
-		owns: ["dv/**", "verification/**", "chip/rtl/ips/*/docs/**"],
-	},
-};
 
 /** 兜底扫描间隔。fs.watch 在某些文件系统上不可靠，不能只靠它。 */
 const SCAN_INTERVAL_MS = 5000;
@@ -99,7 +83,16 @@ const WRITE_SETTLE_MS = 2000;
 export default function fnxbus(pi: ExtensionAPI) {
 	let projectRoot = "";
 	let agent = "";
-	let roles = DEFAULT_ROLES;
+	/**
+	 * 角色表。**没有任何内置默认值**——必须由 `<项目根>/.fnxbus/roles.json` 提供。
+	 *
+	 * 不留兜底表是刻意的：兜底表里写什么角色名、什么目录约定，就等于把使用方的
+	 * 项目结构写进了这个通用组件。角色表是**项目配置**，不是组件的一部分。
+	 *
+	 * 路由、按订阅扇出、单实例锁、inbox/seen/sent 目录全按这张表的键来，
+	 * 所以加第 N 个角色只改那个 json，代码一行不用动。
+	 */
+	let roles: Record<string, Role> = {};
 	let seen: SeenIndex = { ids: new Set<string>(), recent: [] };
 	let extraReadonly: ReadonlySet<string> = new Set<string>();
 	let sentIds = new Set<string>();
@@ -270,7 +263,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 				gateInjectedAt = Date.now();
 				gateHandledLogged = false;
 				const suspicious = d.warnings.some((w) => w.includes("对不上号"));
-				pi.sendUserMessage(renderInjection(parsed.message, d.verdict ?? "FAILED", suspicious), {
+				pi.sendUserMessage(renderInjection(parsed.message, d.verdict ?? "FAILED", suspicious, d.foreignPaths), {
 					deliverAs: "followUp",
 				});
 			}
@@ -282,7 +275,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		agent = process.env.FNXBUS_AGENT ?? process.env.FORENYX_AGENT_NAME ?? "";
 		if (agent.length === 0) {
-			failInit(ctx, "未能确定本端角色名。请设 FNXBUS_AGENT=<角色名>（如 fnx_sw）。");
+			failInit(ctx, "未能确定本端角色名。请设 FNXBUS_AGENT=<角色名>，要和 roles.json 里的键一致。");
 			return;
 		}
 		// 角色名直接当目录名和文件名用，不校验的话 `../..` 就是路径穿越
@@ -303,23 +296,27 @@ export default function fnxbus(pi: ExtensionAPI) {
 		}
 
 		const rolesPath = join(busDir(projectRoot), "roles.json");
-		if (existsSync(rolesPath)) {
-			let raw: unknown;
-			try {
-				raw = JSON.parse(readFileSync(rolesPath, "utf8"));
-			} catch (e) {
-				// 配置文件坏了要拒绝启动，不能默默退回默认表——那样人会以为配置生效了
-				failInit(ctx, `roles.json 不是合法 JSON：${e instanceof Error ? e.message : String(e)}`);
-				return;
-			}
-			const { config, errors } = parseRolesFile(raw);
-			if (errors.length > 0) {
-				failInit(ctx, `roles.json 有 ${errors.length} 处问题：\n${errors.map((x) => `  - ${x}`).join("\n")}`);
-				return;
-			}
-			roles = config.roles;
-			extraReadonly = config.readonlyTools;
+		if (!existsSync(rolesPath)) {
+			// 没有角色表就不启动。不猜、不用内置默认值：猜错的后果是两个 agent
+			// 落到不同的角色定义上，表现为「消息发了但对方不处理」，最难查。
+			failInit(ctx, `找不到角色表 ${rolesPath}。\n${rolesTemplate(agent, rolesPath)}`);
+			return;
 		}
+		let raw: unknown;
+		try {
+			raw = JSON.parse(readFileSync(rolesPath, "utf8"));
+		} catch (e) {
+			failInit(ctx, `roles.json 不是合法 JSON：${e instanceof Error ? e.message : String(e)}`);
+			return;
+		}
+		const { config, errors } = parseRolesFile(raw);
+		if (errors.length > 0) {
+			failInit(ctx, `roles.json 有 ${errors.length} 处问题：\n${errors.map((x) => `  - ${x}`).join("\n")}`);
+			return;
+		}
+		roles = config.roles;
+		extraReadonly = config.readonlyTools;
+
 		if (roles[agent] === undefined) {
 			failInit(ctx, `角色表里没有 ${agent}。\n${rolesTemplate(agent, rolesPath)}`);
 			return;
@@ -511,7 +508,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 			"给同项目的另一个 agent 发一条总线消息。payload 与 files 会按消息契约校验，不合规会原样把错误返回给你，改对再发。files 的 sha256 由总线自己算，你只给 role 和相对项目根的路径。",
 		parameters: Type.Object({
 			to: Type.String({
-				description: "接收方角色名（如 fnx_dv），或 `*` 表示按订阅扇出——投给角色表里订阅了这个 type 的所有角色",
+				description: "接收方角色名，或 `*` 表示按订阅扇出——投给角色表里订阅了这个 type 的所有角色",
 			}),
 			type: Type.String({ description: "消息类型，如 ip_verified / build_failed / need_input" }),
 			text: Type.String({ description: "给人和对方 LLM 读的自然语言说明" }),
@@ -616,7 +613,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 			}
 			const myOwns = roles[agent]?.owns ?? [];
 			// 用 gate.ts 的 globMatch，不要在这里另写一份——第一次实地跑就是因为
-			// 这里手写了个只认前缀的劣化版，把 `chip/rtl/ips/*/docs/**` 中间那个通配符判错了，
+			// 这里手写了个只认前缀的劣化版，把 `a/b/*/docs/**` 中间那个通配符判错了，
 			// 结果发送方明明有权限却被自己的工具挡住。
 			const notMine = msg.files.filter((f) => !myOwns.some((pattern) => globMatch(pattern, f.path)));
 			if (notMine.length > 0) {
@@ -816,6 +813,160 @@ export default function fnxbus(pi: ExtensionAPI) {
 			if (broken.length > 0) lines.push(`坏名片：${broken.join(", ")}`);
 			if (stale.length > 0) lines.push(`刚清掉的陈旧名片（进程已死）：${stale.join(", ")}`);
 			return { content: [{ type: "text", text: lines.join("\n") }], details: { count: cards.length } };
+		},
+	});
+
+	/**
+	 * 初始化一个项目：建 `.fnxbus/project.json` 与 `.fnxbus/roles.json`。
+	 *
+	 * **刻意只问一件事：项目根在哪。** 其余能推的都推：
+	 *
+	 * - 角色名从环境变量读，读不到才问
+	 * - 订阅和产出范围留空——刚装上的人不知道该填什么，而且那是随业务变的，
+	 *   不该在初始化时逼人决定。`--from <模板>` 可以一次填好
+	 *
+	 * 为什么项目根一定要人确认：猜错的后果是两个 agent 各建一个 `.fnxbus/`、
+	 * 互相收不到消息、而且不报错——是最难查的那类故障。问一句「是这里吗」，
+	 * 人回车确认，就不是猜了。
+	 *
+	 * 这个命令在 fnxbus **未启用时也要能用**（它就是用来让它能启用的），
+	 * 所以不看 `initError`、不用启动时算出的 `projectRoot`。
+	 */
+	pi.registerCommand("bus-setup", {
+		description: "fnxbus：初始化这个项目（建 .fnxbus/ 下的两个配置文件）。可选 --from <模板路径>",
+		handler: async (args, ctx) => {
+			const templatePath = /--from\s+(\S+)/.exec(args)?.[1];
+
+			// 项目根：给候选让人选，而不是直接用某一个
+			const here = resolve(ctx.cwd);
+			const git = gitRoot(ctx.cwd);
+			const candidates = [here];
+			if (git !== undefined && git !== here) candidates.push(git);
+			const pickOther = "自己输入路径";
+			const picked = await ctx.ui.select(
+				["项目根定在哪？两个 agent 必须选同一个，否则互相收不到消息。", "", "（这是唯一需要你确认的事）"].join(
+					"\n",
+				),
+				[...candidates.map((c) => (c === here ? `${c}（当前目录）` : `${c}（git 仓库根）`)), pickOther],
+			);
+			if (picked === undefined) return;
+			let projectDir: string;
+			if (picked === pickOther) {
+				const typed = await ctx.ui.input("项目根的绝对路径", here);
+				if (typed === undefined || typed.trim().length === 0) return;
+				projectDir = resolve(typed.trim());
+			} else {
+				projectDir = picked.replace(/（.*）$/, "");
+			}
+			if (!existsSync(projectDir)) {
+				ctx.ui.notify(`目录不存在：${projectDir}`, "error");
+				return;
+			}
+
+			// 角色名：能读就读，读不到才问
+			let roleName = process.env.FNXBUS_AGENT ?? process.env.FORENYX_AGENT_NAME ?? "";
+			if (roleName.length === 0) {
+				const typed = await ctx.ui.input("本端角色名（要和别的 agent 用的名字区分开）", "");
+				if (typed === undefined) return;
+				roleName = typed.trim();
+			}
+			const nameErr = validateAgentName(roleName);
+			if (nameErr !== undefined) {
+				ctx.ui.notify(nameErr, "error");
+				return;
+			}
+
+			// 模板：给了就照它填，没给就留空骨架
+			let incoming: Record<string, Role> = { [roleName]: { subscribe: [], owns: [] } };
+			let readonlyTools: string[] = [];
+			if (templatePath !== undefined) {
+				const tpl = resolve(templatePath);
+				if (!existsSync(tpl)) {
+					ctx.ui.notify(`模板不存在：${tpl}`, "error");
+					return;
+				}
+				let tplRaw: unknown;
+				try {
+					tplRaw = JSON.parse(readFileSync(tpl, "utf8"));
+				} catch (e) {
+					ctx.ui.notify(`模板不是合法 JSON：${e instanceof Error ? e.message : String(e)}`, "error");
+					return;
+				}
+				const parsedTpl = parseRolesFile(tplRaw);
+				if (parsedTpl.errors.length > 0) {
+					ctx.ui.notify(`模板有问题：\n${parsedTpl.errors.map((x) => `  - ${x}`).join("\n")}`, "error");
+					return;
+				}
+				incoming = parsedTpl.config.roles;
+				readonlyTools = [...parsedTpl.config.readonlyTools];
+				if (incoming[roleName] === undefined) {
+					ctx.ui.notify(
+						`模板里没有 ${roleName} 这个角色（有的是：${Object.keys(incoming).join(", ")}）。\n` +
+							"要么换个模板，要么用 FNXBUS_AGENT 指定一个模板里有的角色名。",
+						"warning",
+					);
+				}
+			}
+
+			const dir = busDir(projectDir);
+			const projectFile = join(dir, "project.json");
+			const rolesFile = join(dir, "roles.json");
+
+			// 已有的角色表要合并，不能覆盖——第二个 agent 来 setup 时别把第一个的配置冲掉
+			let merged: Record<string, Role> = {};
+			let mergedTools = readonlyTools;
+			let hadExisting = false;
+			if (existsSync(rolesFile)) {
+				hadExisting = true;
+				let existingRaw: unknown;
+				try {
+					existingRaw = JSON.parse(readFileSync(rolesFile, "utf8"));
+				} catch (e) {
+					ctx.ui.notify(
+						`已有的 roles.json 读不出来，没有动它：${e instanceof Error ? e.message : String(e)}`,
+						"error",
+					);
+					return;
+				}
+				const parsedExisting = parseRolesFile(existingRaw);
+				if (parsedExisting.errors.length > 0) {
+					ctx.ui.notify(
+						`已有的 roles.json 有问题，没有动它：\n${parsedExisting.errors.map((x) => `  - ${x}`).join("\n")}`,
+						"error",
+					);
+					return;
+				}
+				merged = parsedExisting.config.roles;
+				mergedTools = [...parsedExisting.config.readonlyTools];
+			}
+			const mergeResult = mergeRoles(merged, mergedTools, incoming, readonlyTools);
+			merged = mergeResult.roles;
+			mergedTools = mergeResult.readonlyTools;
+			const overwritten = mergeResult.overwritten;
+
+			try {
+				if (!existsSync(projectFile)) writeAtomic(projectFile, `${JSON.stringify({}, null, "\t")}\n`);
+				const body = mergedTools.length > 0 ? { roles: merged, readonlyTools: mergedTools } : { roles: merged };
+				writeAtomic(rolesFile, `${JSON.stringify(body, null, "\t")}\n`);
+			} catch (e) {
+				ctx.ui.notify(`写配置失败：${e instanceof Error ? e.message : String(e)}`, "error");
+				return;
+			}
+
+			const lines = [
+				`项目根：${projectDir}`,
+				hadExisting ? `已有角色表，合并进去了` : `建好了 ${projectFile}`,
+				`写好了 ${rolesFile}`,
+				`角色：${Object.keys(merged).join(", ")}`,
+			];
+			if (overwritten.length > 0) lines.push(`覆盖了已有的：${overwritten.join(", ")}`);
+			const mine = merged[roleName];
+			if (mine !== undefined && mine.subscribe.length === 0) {
+				lines.push("", `${roleName} 的 subscribe 是空的——它收不到任何扇出消息（指名发给它的仍然能收到）。`);
+				lines.push(`要订阅就编辑 ${rolesFile}，或者用 --from <模板> 重跑一次。`);
+			}
+			lines.push("", "重启本 agent 生效。");
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 

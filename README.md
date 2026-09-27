@@ -39,38 +39,77 @@
 
 装完记进 `<agentDir>/settings.json` 的 `packages`，之后每次启动自动加载。
 
-## 用
+## 初始化一个项目
 
-每个项目根下要有：
+在项目里起 agent，跑一次：
+
+```
+/bus-setup                      问一句项目根，建好配置骨架
+/bus-setup --from <模板路径>     照模板建，订阅和产出范围一次填好
+```
+
+**它只问一件事：项目根定在哪。** 角色名从环境变量读出来，订阅和产出范围留空
+（刚装上的人不知道该填什么，而且那是随业务变的，不该在初始化时逼人决定）。
+
+为什么项目根一定要人确认：猜错的后果是两个 agent 各建一个 `.fnxbus/`、互相收不到消息、
+而且不报错——是最难查的那类故障。问一句「是这里吗」，人回车确认，就不是猜了。
+
+第二个 agent 再跑 `/bus-setup` 时会**合并**进已有的角色表，不会冲掉前一个写的配置；
+真盖掉了谁会明确报出来。
+
+跑完重启 agent 生效。
+
+## 配置长什么样
+
+`/bus-setup` 生成的就是这两个文件：
 
 ```
 <项目根>/.fnxbus/
-    project.json        标识项目根（内容可以是 {}）
-    roles.json          谁订阅什么、谁能写哪些路径
+    project.json        标识这里是项目根（内容就是 {}）
+    roles.json          谁订阅什么、谁的产出在哪
 ```
 
-`roles.json`：
+`roles.json` 也可以照 `roles.example.json` 手写：
 
 ```jsonc
 {
   "roles": {
-    "fnx_sw": { "subscribe": ["ip_verified"], "owns": ["sw/**", "software/**"] },
-    "fnx_dv": { "subscribe": ["build_failed", "need_input"], "owns": ["dv/**"] }
+    "agent-a": {
+      "subscribe": ["work_done"],    // 它要处理的消息类型
+      "owns": ["a/**"]               // 它的产出放在哪，相对项目根
+    },
+    "agent-b": {
+      "subscribe": ["review_failed", "need_input"],
+      "owns": ["b/**", "shared/docs/**"]
+    }
   },
-  "readonlyTools": ["a2a_inbox"]   // 别的扩展的只读工具，报备了就不会被闸门白问一次
+  "readonlyTools": []   // 别的扩展的只读工具名，报备了就不会被闸门白问一次
 }
 ```
 
-加第 N 个角色只改这个文件，**代码里除一张兜底表没有任何地方写死角色名**。
+三件事要知道：
 
-状态目录用 `.fnxbus/` 而不是某个 agent 的 `configDir`（`.forenyx` 之类）：那个值是每个 agent
+- **键名就是角色名**，启动时用 `FNXBUS_AGENT` 指定本端是哪个，两边必须一致
+- **`subscribe` 只管扇出**（`to: "*"`）。指名发给它的消息，不管订没订都会送到
+- **`owns` 只是标注，不是权限**。它声明「这个角色的产出放在哪」，用来在消息里
+  标出「这个文件不是它自己的产出」。它**不限制** agent 能读写什么——agent 本来就能
+  读写项目根下任意文件（`write`/`edit` 跟总线无关），而「指着对方的文件说这行有问题」
+  是正常协作，不该被挡。重叠了启动时会警告，但不影响运行
+
+**没有这个文件就不启动**，报错里会给一段能直接照着建的模板。不设内置默认值是刻意的：
+默认值里写什么角色名、什么目录约定，就等于把使用方的项目结构写进了这个通用组件。
+
+加第 N 个角色只改这个文件，代码一行不用动——路由、扇出、单实例锁、
+`inbox`/`seen`/`sent` 目录全按这张表的键来。
+
+状态目录固定叫 `.fnxbus/`，**不跟宿主 agent 的 `configDir` 走**：那个值是每个 agent
 自己定的，不一致时两边会各找一个目录、谁也收不到谁的消息，而且不报错。
 
 ## 环境变量
 
 | | |
 |---|---|
-| `FNXBUS_AGENT` | 本端角色名，缺省取 `FORENYX_AGENT_NAME` |
+| `FNXBUS_AGENT` | 本端角色名，要和 `roles.json` 里的键一致。没设时退而读宿主 agent 自己的名字（`FORENYX_AGENT_NAME`） |
 | `FNXBUS_PROJECT` | 项目根，缺省向上找 `.fnxbus/project.json`，再退到 git 根；都没有则**拒绝注册**（不自动建） |
 
 ## 要求

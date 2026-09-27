@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { findOwnsOverlaps, parseRolesFile, type Role, rolesTemplate, validateAgentName } from "../extensions/roles.ts";
+import {
+	findOwnsOverlaps,
+	mergeRoles,
+	parseRolesFile,
+	type Role,
+	rolesTemplate,
+	validateAgentName,
+} from "../extensions/roles.ts";
 
 describe("validateAgentName", () => {
 	it("接受正常的角色名", () => {
@@ -129,10 +136,63 @@ describe("findOwnsOverlaps", () => {
 
 describe("rolesTemplate", () => {
 	it("给出可以直接粘贴的片段", () => {
-		const t = rolesTemplate("fnx_pd", "/p/.fnxbus/roles.json");
+		const t = rolesTemplate("agent-c", "/p/.fnxbus/roles.json");
 		expect(t).toContain("/p/.fnxbus/roles.json");
-		expect(t).toContain('"fnx_pd": {');
+		expect(t).toContain('"agent-c": {');
 		expect(t).toContain('"subscribe"');
 		expect(t).toContain('"owns"');
+	});
+
+	it("给的是完整文件内容，不是只有片段——因为文件可能根本不存在", () => {
+		const t = rolesTemplate("agent-c", "/p/.fnxbus/roles.json");
+		// 含外层 roles 包裹，照着建一个新文件就能用
+		expect(t).toContain('"roles"');
+		expect(t).toContain("{");
+		expect(t).toContain("}");
+	});
+
+	it("不假设角色名有任何前缀（这是个通用组件，不认识某家产品的命名习惯）", () => {
+		// 路径故意不带 fnx，这样「模板里出现 fnx」只可能来自它自己凭空加的前缀
+		const t = rolesTemplate("whatever_name", "/p/bus/roles.json");
+		expect(t).toContain('"whatever_name": {');
+		expect(t).not.toContain("fnx");
+	});
+});
+
+describe("mergeRoles（/bus-setup 用它）", () => {
+	const r = (subscribe: string[], owns: string[]): Role => ({ subscribe, owns });
+
+	it("第二个 agent 来初始化时，不能冲掉第一个写的配置", () => {
+		const existing = { "agent-a": r(["x"], ["a/**"]) };
+		const incoming = { "agent-b": r(["y"], ["b/**"]) };
+		const out = mergeRoles(existing, [], incoming, []);
+		expect(Object.keys(out.roles).sort()).toEqual(["agent-a", "agent-b"]);
+		expect(out.roles["agent-a"].subscribe).toEqual(["x"]);
+		expect(out.overwritten).toEqual([]);
+	});
+
+	it("同名角色会被盖掉，而且必须报出来", () => {
+		const existing = { "agent-a": r(["old"], ["old/**"]) };
+		const incoming = { "agent-a": r(["new"], ["new/**"]) };
+		const out = mergeRoles(existing, [], incoming, []);
+		expect(out.roles["agent-a"].subscribe).toEqual(["new"]);
+		expect(out.overwritten).toEqual(["agent-a"]);
+	});
+
+	it("readonlyTools 取并集、不重复", () => {
+		const out = mergeRoles({}, ["t1", "t2"], {}, ["t2", "t3"]);
+		expect(out.readonlyTools.sort()).toEqual(["t1", "t2", "t3"]);
+	});
+
+	it("从空表开始（第一次初始化）", () => {
+		const out = mergeRoles({}, [], { "agent-a": r([], []) }, []);
+		expect(Object.keys(out.roles)).toEqual(["agent-a"]);
+		expect(out.overwritten).toEqual([]);
+	});
+
+	it("不改传进来的对象（避免调用方拿到被污染的引用）", () => {
+		const existing = { "agent-a": r(["x"], ["a/**"]) };
+		mergeRoles(existing, [], { "agent-b": r([], []) }, []);
+		expect(Object.keys(existing)).toEqual(["agent-a"]);
 	});
 });

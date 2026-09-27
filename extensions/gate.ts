@@ -51,7 +51,16 @@ export interface GateContext {
 	now: number;
 	/** 实算某个相对项目根的路径的 sha256。文件不存在返回 undefined。 */
 	shaOf(relPath: string): string | undefined;
-	/** 发送方被允许写的路径（相对项目根，glob）。见设计 13.1 的角色表。 */
+	/**
+	 * 发送方声明的产出路径（相对项目根，glob）。
+	 *
+	 * **只用来标注，不用来拒收。** 早先这里是拒收条件——「引用了不属于你的文件就整条丢弃」，
+	 * 但那个语义站不住：agent 本来就能读写项目根下任意文件（pi 的 write/edit 跟总线无关），
+	 * 而「指着对方的文件说这行有问题」是完全正常的协作。按 owns 拒收会把这种正常消息挡掉。
+	 *
+	 * 现在的用法：引用了范围外的文件就在日志和注入文本里标一句「这不是它的产出」，
+	 * 让接收方自己判断。空数组表示没声明，不标注。
+	 */
 	senderOwns: readonly string[];
 	/** 订阅了这个 type 的本端角色。空数组 = 无人订阅 → 只记日志。 */
 	subscribers: readonly string[];
@@ -77,6 +86,8 @@ export interface GateDecision {
 	unknownPayloadKeys: string[];
 	/** 按最保守解读后的 verdict，注入模板用它，不用原始值。 */
 	verdict?: string;
+	/** 引用了但不在发送方产出范围内的文件路径。传给 `renderInjection` 标注出来。 */
+	foreignPaths: string[];
 }
 
 /**
@@ -106,12 +117,19 @@ export function globMatch(pattern: string, path: string): boolean {
  */
 export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 	if (!parsed.ok) {
-		return { action: "reject", reasons: parsed.errors, warnings: [], unknownPayloadKeys: [] };
+		return { action: "reject", reasons: parsed.errors, warnings: [], unknownPayloadKeys: [], foreignPaths: [] };
 	}
 
 	const { message, warnings, unknownPayloadKeys } = parsed;
 	const reasons: string[] = [];
 	const warns = [...warnings];
+
+	// 引用了不在发送方产出范围内的文件：只标注，不拒收。理由见 GateContext.senderOwns 的注释。
+	// 在开头就算出来，因为每个返回点都要带上它。
+	const foreignPaths =
+		ctx.senderOwns.length === 0
+			? []
+			: message.files.filter((f) => !ctx.senderOwns.some((p) => globMatch(p, f.path))).map((f) => f.path);
 
 	if (ctx.seen.has(message.id)) {
 		// 幂等命中不是错误，是重复投递。记日志、不注入、也不当失败回给发送方。
@@ -120,6 +138,7 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 			reasons: [`id ${message.id} 已处理过，按幂等丢弃`],
 			warnings: warns,
 			unknownPayloadKeys,
+			foreignPaths,
 		};
 	}
 
@@ -139,6 +158,7 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 			],
 			warnings: warns,
 			unknownPayloadKeys,
+			foreignPaths,
 		};
 	}
 
@@ -151,15 +171,12 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 			],
 			warnings: warns,
 			unknownPayloadKeys,
+			foreignPaths,
 		};
 	}
 
-	for (const f of message.files) {
-		if (!ctx.senderOwns.some((p) => globMatch(p, f.path))) {
-			// 发送方引用了不属于它的文件。这既可能是配置错，也可能是被诱导——
-			// 两种都不该放行（需求里「文件归属」那条硬要求）。
-			reasons.push(`files[role=${f.role}] 路径 ${f.path} 不在发送方 ${message.from} 的 owns 范围内`);
-		}
+	for (const path of foreignPaths) {
+		warns.push(`${path} 不在 ${message.from} 声明的产出范围内——它引用的是别人的文件`);
 	}
 
 	for (const f of message.files) {
@@ -175,7 +192,7 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 	}
 
 	if (reasons.length > 0) {
-		return { action: "reject", reasons, warnings: warns, unknownPayloadKeys };
+		return { action: "reject", reasons, warnings: warns, unknownPayloadKeys, foreignPaths };
 	}
 
 	// 订阅表只管「扇出时该投给谁」。指名发来的消息（回复、拒收通知、点对点通知）
@@ -187,6 +204,7 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 			reasons: [`本端没有角色订阅 ${message.type}`],
 			warnings: warns,
 			unknownPayloadKeys,
+			foreignPaths,
 		};
 	}
 
@@ -195,6 +213,7 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
 		reasons: [],
 		warnings: warns,
 		unknownPayloadKeys,
+		foreignPaths,
 		verdict: effectiveVerdict(message.payload),
 	};
 }
@@ -210,7 +229,13 @@ export function decide(parsed: ParseResult, ctx: GateContext): GateDecision {
  *    但要清楚——这句话只是提示，真正的闸门在 guard.ts 的 `tool_call` 拦截里。
  *    B2 三次复现证明：写在措辞里完全不管用。
  */
-export function renderInjection(message: BusMessage, verdict: string, suspiciousReply = false): string {
+export function renderInjection(
+	message: BusMessage,
+	verdict: string,
+	suspiciousReply = false,
+	/** 不在发送方声明的产出范围内的文件路径。标出来让接收方知道这是「别人的文件」。 */
+	foreignPaths: readonly string[] = [],
+): string {
 	const lines = [
 		`📨 来自 ${message.from} 的 ${message.type}（消息 id ${message.id}）`,
 		"",
@@ -226,7 +251,8 @@ export function renderInjection(message: BusMessage, verdict: string, suspicious
 		lines.push(`missing: ${message.payload.missing.join(", ")}`);
 	}
 	for (const f of message.files) {
-		lines.push(`file[${f.role}]: ${f.path}（摘要已核对一致）`);
+		const foreign = foreignPaths.includes(f.path) ? "，**不是它自己的产出**" : "";
+		lines.push(`file[${f.role}]: ${f.path}（摘要已核对一致${foreign}）`);
 	}
 
 	if (message.reply_to !== null) {

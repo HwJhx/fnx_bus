@@ -1,9 +1,10 @@
 /**
  * fnxbus —— 角色表的解析与校验
  *
- * 总线现在只有 `fnx_sw` / `fnx_dv` 两个角色，但产品要上 5 个，而且以后还会加。
+ * 角色数量是会变的：今天两个，明天五个。
  * 所以路由、扇出、单实例锁、inbox/seen/sent 目录**一律按角色表的键来**，
- * 代码里没有任何地方写死角色名（`DEFAULT_ROLES` 只是「开箱可用」的兜底）。
+ * 代码里没有任何地方写死角色名，也**没有内置默认值**——角色表是使用方的项目配置，
+ * 不是这个组件的一部分。没有它就拒绝启动（见 index.ts 的 session_start）。
  *
  * 加第 N 个角色要做的事只有一件：往 `<项目根>/.fnxbus/roles.json` 里加一段。
  * 这个文件存在的意义就是把「加一个角色」这件事该校验的都校验掉：
@@ -12,7 +13,7 @@
  * |---|---|
  * | 角色名字符集 | 角色名会当**文件名和目录名**用（`inbox/<agent>/`、`locks/<agent>.lock`）。不校验的话 `FNXBUS_AGENT=../../etc` 就是路径穿越 |
  * | roles.json 结构 | 5 个角色的配置是手写的，`owns` 写成字符串而不是数组这种错要当场报，不能默默当成空 |
- * | `owns` 重叠 | 两个角色都声称能写 `software/**` 时，「文件归属」这条硬要求就失效了。设计里提过 `fnxbus doctor` 要查这个 |
+ * | `owns` 重叠 | 两个角色都声称能写同一片路径时，「谁的文件谁负责」这条就失效了 |
  *
  * 纯函数，可单测。
  */
@@ -114,8 +115,8 @@ export function parseRolesFile(raw: unknown): { config: RolesConfig; errors: str
 /**
  * 从一个 owns 模式造一条「代表性路径」，用来判两个模式会不会撞。
  *
- * 直接比字面前缀会误报：`chip/rtl/ips/*​/docs/**` 和 `chip/rtl/ips/*​/model/**`
- * 截断到第一个通配符都是 `chip/rtl/ips/`，但它们其实碰不到一起。
+ * 直接比字面前缀会误报：`a/b/*​/docs/**` 和 `a/b/*​/model/**`
+ * 截断到第一个通配符都是 `a/b/`，但它们其实碰不到一起。
  * 用代表路径 + `globMatch` 双向试就准得多。
  */
 function representativePath(pattern: string): string {
@@ -164,13 +165,44 @@ export function findOwnsOverlaps(roles: Record<string, Role>): OwnsOverlap[] {
  *
  * 「加一个角色」不该需要去翻文档或读源码——报错里就把该填的东西给出来。
  */
+export interface MergeResult {
+	roles: Record<string, Role>;
+	readonlyTools: string[];
+	/** 被新内容盖掉的角色名。调用方要把这个报给人看——悄悄覆盖别人的配置是最坏的情况。 */
+	overwritten: string[];
+}
+
+/**
+ * 把新角色合并进已有的角色表。
+ *
+ * `/bus-setup` 用它。**第二个 agent 来初始化时，不能把第一个写的配置冲掉** ——
+ * 所以是合并而不是覆盖，而且盖掉了谁要说出来。
+ */
+export function mergeRoles(
+	existing: Record<string, Role>,
+	existingTools: readonly string[],
+	incoming: Record<string, Role>,
+	incomingTools: readonly string[],
+): MergeResult {
+	const overwritten = Object.keys(incoming).filter((k) => existing[k] !== undefined);
+	return {
+		roles: { ...existing, ...incoming },
+		readonlyTools: [...new Set([...existingTools, ...incomingTools])],
+		overwritten,
+	};
+}
+
 export function rolesTemplate(agent: string, rolesPath: string): string {
 	return [
-		`请在 ${rolesPath} 的 "roles" 里加一段，例如：`,
+		`${rolesPath} 该长这样（文件不存在就照着建；已存在就把 "${agent}" 那段加进 "roles" 里）：`,
 		"",
-		`  "${agent}": {`,
-		`    "subscribe": ["<这个角色要处理的消息类型>"],`,
-		`    "owns": ["${agent.replace(/^fnx_/, "")}/**"]`,
+		"  {",
+		'    "roles": {',
+		`      "${agent}": {`,
+		'        "subscribe": ["<这个角色要处理的消息类型>"],',
+		'        "owns": ["<这个角色可写的目录>/**"]',
+		"      }",
+		"    }",
 		"  }",
 		"",
 		"subscribe 决定它能收到哪些扇出消息（指名发给它的一律能收到）；",
