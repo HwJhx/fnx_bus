@@ -908,3 +908,128 @@ describe("bus_send：投给谁、不投给谁", () => {
 		expect(r.content[0].text).toContain("总线未启用");
 	});
 });
+
+/**
+ * 退出时把「已记账、已删档、但没走完一轮」的消息报出来。
+ *
+ * 不改那个取舍（仍然是宁可丢不可重复执行），只让它**别静默**。
+ * 这条日志同时是个测量：它实际出现的频率决定值不值得把取舍翻过来。
+ */
+describe("丢失不静默：退出时报没走完的消息", () => {
+	it("走完一轮的不报", () => {
+		initProject();
+		putInbox("01CLEAN0001");
+		const pi = boot();
+		expect(pi.delivered).toHaveLength(1);
+
+		pi.fire("agent_end"); // 正常走完
+		pi.fire("session_shutdown");
+
+		expect(logEvents()).toContain("handled");
+		expect(logEvents()).not.toContain("unhandled_at_exit");
+	});
+
+	it("投递完就退出：报出来，并说清它丢了", () => {
+		initProject();
+		putInbox("01GONE00001");
+		const pi = boot();
+		expect(pi.delivered).toHaveLength(1);
+
+		// 不 fire agent_end —— 模拟模型还没读到就退出
+		pi.fire("session_shutdown");
+
+		expect(logEvents()).toContain("unhandled_at_exit");
+		const line = readFileSync(join(root, ".fnxbus", "log.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((l) => JSON.parse(l))
+			.find((r) => r.event === "unhandled_at_exit");
+		expect(line.id).toBe("01GONE00001");
+		expect(line.note).toContain("已从 inbox 删除");
+		expect(line.note).toContain("下次启动不会重来");
+		// 而且消息确实无从恢复：inbox 空了，seen 里记着
+		expect(inboxFiles()).toEqual([]);
+		expect(seenLines()).toHaveLength(1);
+	});
+
+	it("被人接管的不重复报（它已经有终态了）", () => {
+		initProject();
+		putInbox("01TAKEN0001");
+		const pi = boot();
+
+		pi.fire("input", { source: "interactive" }); // 人接管
+		pi.fire("session_shutdown");
+
+		expect(logEvents()).toContain("handled");
+		expect(logEvents()).not.toContain("unhandled_at_exit");
+	});
+
+	it("批量注入只处理了一部分：剩下的每条都报 —— 这才是真正的风险场景", () => {
+		// drain 是个 for 循环：inbox 里有几条就一次全部记账、删档、排队。
+		// 模型一条条处理，后面几条可能等好几分钟，这期间退出就一起丢。
+		// 离线积压正是这种场景。
+		initProject();
+		// payload 必须各不相同：内容指纹去重只看 type/from/payload，不看 id 和 text。
+		// 同样的 payload 投三条，后两条会被判成重复而只记日志（这个坑踩过两次了）。
+		["01BATCH0001", "01BATCH0002", "01BATCH0003"].forEach((id, i) => {
+			putInbox(id, { payload: { ip: `ip${i}`, verdict: "PASS" } });
+		});
+
+		const pi = boot();
+		expect(pi.delivered).toHaveLength(3); // 三条一次全排进队列
+		expect(inboxFiles()).toEqual([]); // 三条全删档了
+		expect(seenLines()).toHaveLength(3); // 三条全记账了
+
+		// 只有最后一条走完一轮（gateMessageId 只保留最后一条）
+		pi.fire("agent_end");
+		pi.fire("session_shutdown");
+
+		const lost = readFileSync(join(root, ".fnxbus", "log.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((l) => JSON.parse(l))
+			.filter((r) => r.event === "unhandled_at_exit")
+			.map((r) => r.id)
+			.sort();
+		expect(lost).toEqual(["01BATCH0001", "01BATCH0002"]);
+	});
+
+	it("一条都没注入过就不报", () => {
+		initProject();
+		const pi = boot();
+		pi.fire("session_shutdown");
+		expect(logEvents()).not.toContain("unhandled_at_exit");
+	});
+});
+
+describe("内容去重（这个坑踩过两次，钉住它）", () => {
+	it("payload 相同的两条：第二条只记日志，不注入", () => {
+		initProject();
+		// id 和 text 不同，但 type/from/payload 相同 —— 指纹一样
+		putInbox("01SAME00001");
+		putInbox("01SAME00002");
+
+		const pi = boot();
+
+		expect(pi.delivered).toHaveLength(1); // 只投了第一条
+		expect(logEvents()).toContain("inject");
+		expect(logEvents()).toContain("log_only"); // 第二条的下场
+		expect(inboxFiles()).toEqual([]); // 两条都从 inbox 清掉了
+		expect(seenLines()).toHaveLength(2); // 两条都记了账
+
+		pi.fire("session_shutdown");
+	});
+
+	it("payload 不同就各自注入", () => {
+		initProject();
+		putInbox("01DIFF00001", { payload: { ip: "crc", verdict: "PASS" } });
+		putInbox("01DIFF00002", { payload: { ip: "pwm", verdict: "PASS" } });
+
+		const pi = boot();
+
+		expect(pi.delivered).toHaveLength(2);
+		expect(logEvents()).not.toContain("log_only");
+
+		pi.fire("session_shutdown");
+	});
+});

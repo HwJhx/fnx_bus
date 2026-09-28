@@ -112,6 +112,22 @@ export default function fnxbus(pi: ExtensionAPI) {
 	let gateInjectedAt = 0;
 	/** 本条消息的 `handled` 是否已记过。一条消息可能跨多轮，只在第一轮结束时记一次。 */
 	let gateHandledLogged = true;
+	/**
+	 * 已投递但还没走完一轮的消息（id → 注入时刻）。**只为了让丢失不静默。**
+	 *
+	 * `drain` 的顺序是记账 → 删 inbox 文件 → 最后才排队投递。投递用的是 `followUp`，
+	 * 模型要一条条处理；而 `drain` 是个 for 循环，inbox 里有几条就一次全部记账删档排队。
+	 * 于是批量场景下（离线积压正是这种）**最后几条从「被记账删档」到「被模型读到」
+	 * 可能隔好几分钟**，这期间进程异常终止，那几条就是 seen 里有、inbox 里没有、
+	 * 模型没看过——永久丢且下次启动不会重来。
+	 *
+	 * 宁可丢不可重复执行是刻意的取舍，但**静默是不可接受的**：静默失败是最难查的一类，
+	 * 我们当初就是拿这一条判 pi-a2a 的 H5 失败的，不能自己犯同样的毛病。
+	 *
+	 * 所以退出时把没走完的报出来。这条日志同时是个**测量**：它实际出现的频率，
+	 * 决定值不值得把那个取舍翻过来（改成投递成功后才记账，代价是可能重复执行）。
+	 */
+	const pendingInjected = new Map<string, number>();
 
 	/**
 	 * 初始化失败的统一出口。
@@ -313,6 +329,8 @@ export default function fnxbus(pi: ExtensionAPI) {
 				pi.sendUserMessage(renderInjection(parsed.message, d.verdict ?? "FAILED", suspicious, d.foreignPaths), {
 					deliverAs: "followUp",
 				});
+				// 排队成功不等于模型看过了。走完一轮才从这里摘掉，退出时还剩的就是丢了的。
+				pendingInjected.set(item.id, gateInjectedAt);
 			}
 		} finally {
 			draining = false;
@@ -424,6 +442,19 @@ export default function fnxbus(pi: ExtensionAPI) {
 		watcher?.close();
 		if (timer !== undefined) clearInterval(timer);
 		if (initError.length === 0 && projectRoot.length > 0) {
+			// 先报没走完的，再注销：这些消息已经从 inbox 删掉、seen 也记了账，
+			// 但模型没看过，下次启动不会重来 —— 它们丢了，必须留下痕迹。
+			const now = Date.now();
+			for (const [id, injectedAt] of pendingInjected) {
+				appendLog(projectRoot, {
+					ts: now,
+					event: "unhandled_at_exit",
+					id,
+					to: agent,
+					note: `注入后 ${now - injectedAt} ms 进程就退出了。这条消息已从 inbox 删除、seen 已记账，但没走完一轮——它丢了，下次启动不会重来`,
+				});
+			}
+			pendingInjected.clear();
 			releaseLock(projectRoot, agent);
 			removeCard(projectRoot, agent);
 			appendLog(projectRoot, { ts: Date.now(), event: "unregistered", from: agent });
@@ -457,6 +488,9 @@ export default function fnxbus(pi: ExtensionAPI) {
 						to: agent,
 						note: `被人接管，自动处理未走完（注入后 ${Date.now() - gateInjectedAt} ms）`,
 					});
+					// 已经有终态了（「被人接管」），别在退出时再报一次「丢了」——
+					// 那条路要留给「投递完进程就消失、连接管都没有」的情况。
+					pendingInjected.delete(guard.gateMessageId);
 				}
 			}
 		}
@@ -483,6 +517,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 			to: agent,
 			note: `从注入到这一轮结束 ${now - gateInjectedAt} ms`,
 		});
+		pendingInjected.delete(guard.gateMessageId);
 	});
 
 	/**
