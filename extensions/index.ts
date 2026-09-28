@@ -209,6 +209,32 @@ export default function fnxbus(pi: ExtensionAPI) {
 	function drain(): void {
 		if (draining || initError.length > 0) return;
 		/**
+		 * 没有可供人批准的 UI 时**只发不收**（`-p` 打印模式、`json` 模式）。
+		 *
+		 * 收了也没用：那种场景下没人能批准闸门的询问，`decideToolCall` 对任何写操作都是
+		 * `block`，所以「能收消息」在这些模式里本来就是名义上的能力。
+		 *
+		 * 而实测（2026-09-28，复现 2/2）证明它不只是没用，是有害的 —— `-p` 启动时
+		 * inbox 里只要有一条积压：
+		 *
+		 * ```
+		 * t+0ms   registered
+		 * t+3ms   inject         ← drain 取走消息：删 inbox 文件、记 seen、排队投递
+		 * t+7ms   gate_released  「人主动输入」  ← -p 的 prompt 被判成 interactive
+		 * t+8ms   handled        「被人接管，自动处理未走完（注入后 3 ms）」
+		 * t+10ms  unregistered
+		 * ```
+		 *
+		 * stderr：`Agent is already processing.…`，**退出码 1** —— 注入的消息和 `-p` 自己的
+		 * prompt 撞车，三重后果：①整个 `-p` 调用失败，它本来要干的活没干
+		 * ②那条消息永久丢失（seen 记了 inject、inbox 文件删了、LLM 只有 3ms 根本没看到）
+		 * ③`-p` 的 prompt 被当成「人主动输入」，把闸门释放了，而这个模式里根本没有人。
+		 *
+		 * 「离线攒消息、下次启动补投」是设计里的正常场景，`-p` 又是脚本化调用的常见形式，
+		 * 这个组合不罕见。消息留在 inbox 等下一个有人在场的会话处理 —— 那条路已经验过。
+		 */
+		if (sessionCtx !== undefined && !sessionCtx.hasUI) return;
+		/**
 		 * agent 正在干活时不处理消息。**这是修一个因果错位的 bug，不是性能优化。**
 		 *
 		 * 注入用的是 `deliverAs: "followUp"`，pi 的语义是「等 agent 没有待跑的工具调用了才投递」
