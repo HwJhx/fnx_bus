@@ -16,7 +16,11 @@ import os
 import sys
 
 REPORT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/vitest-report.json"
-OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "TESTS.md")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(ROOT, "TESTS.md")
+# 真机测试那部分是手写的（单测清单自动导出，真机跑什么、还差什么只能人写），
+# 放在独立文件里编辑，生成时拼到末尾。改它不会被下一次生成覆盖。
+MANUAL = os.path.join(ROOT, "test", "manual-tests.md")
 
 # 每个文件管什么。**照实写**——比如 contract.test.ts 实际同时测 contract.ts 和 gate.ts，
 # 文件名只提了一个，这种事要写出来而不是让人自己去发现。
@@ -71,21 +75,22 @@ def main() -> None:
     order = ORDER + [f for f in by_file if f not in ORDER]
 
     L: list[str] = []
-    L.append("# 单测清单")
+    L.append("# 测试清单")
     L.append("")
     total_all = d.get("numTotalTests", 0)
     passed = d.get("numPassedTests", 0)
-    L.append(f"{total_all} 个用例，{passed} 通过。自动导出，不要手改。")
+    L.append(f"{total_all} 个单测用例，{passed} 通过；外加末尾的真机测试。")
     L.append("")
-    L.append("重新生成：")
+    L.append("「N 个测试全过」说明不了测了什么。这份清单的用处是改动前扫一眼")
+    L.append("「这块有没有被覆盖」，不用翻五个测试文件。")
+    L.append("")
+    L.append("**改哪里**：单测部分（下面到「真机测试」之前）是从 vitest 导出的，手改会被覆盖 ——")
+    L.append("要改就改测试本身。真机测试那一节是手写的，源文件 `test/manual-tests.md`。")
     L.append("")
     L.append("```bash")
     L.append("node node_modules/vitest/dist/cli.js --run --reporter=json --outputFile=/tmp/vitest-report.json")
     L.append("python3 scripts/gen-test-list.py")
     L.append("```")
-    L.append("")
-    L.append("「N 个测试全过」说明不了测了什么。这份清单的用处是改动前扫一眼")
-    L.append("「这块有没有被覆盖」，不用翻五个测试文件。")
     L.append("")
     L.append("## 分布")
     L.append("")
@@ -122,8 +127,16 @@ def main() -> None:
                 L.append(f"- {t}")
             L.append("")
 
+    if os.path.exists(MANUAL):
+        L.append("---")
+        L.append("")
+        L.append(open(MANUAL, encoding="utf-8").read().rstrip())
+        L.append("")
+    else:
+        print(f"注意：没找到 {MANUAL}，真机测试那部分没拼进去")
+
     open(OUT, "w", encoding="utf-8").write("\n".join(L) + "\n")
-    print(f"写好 {OUT}：{total} 条用例，{len(by_file)} 个文件")
+    print(f"写好 {OUT}：{total} 条用例，{len(by_file)} 个文件" + ("，含真机部分" if os.path.exists(MANUAL) else ""))
 
 
 if __name__ == "__main__":
