@@ -172,6 +172,9 @@ npm test          # 173 个单测
 npm run check     # biome + tsgo + 单测
 ```
 
+**测了什么**：[`TESTS.md`](./TESTS.md) 是逐条清单（自动导出，`scripts/gen-test-list.py`
+刷新）。改动前扫一眼「这块有没有被覆盖」比看「173 个全过」有用。
+
 `test/extension.test.ts` 用一个**假 pi** 驱动扩展入口，覆盖 drain 的守卫、闸门联动、
 扇出、坏消息隔离。它保护的是「自己的逻辑不退化」，**不能**证明「对 pi 行为的假设仍然成立」
 —— 后者只有真跑 agent 能验。那些假设在测试文件头列了出来，并标了依据哪次实测。
