@@ -192,3 +192,77 @@ describe("splitShell", () => {
 		expect(splitShell("echo a\\;b").map((s) => s.words)).toEqual([["echo", "a;b"]]);
 	});
 });
+
+/**
+ * 白名单里那些「带某个参数就变成写工具」的命令。
+ *
+ * B7 实测时查 `sed -n` 误拦，顺带发现 `find`、`sort`、`uniq` 早就在白名单里，
+ * 而它们都有能写文件的参数 —— 其中 `find -exec rm` 正是 E1 要防的事，闸门在这条路上一直是漏的。
+ */
+describe("白名单命令的写参数", () => {
+	it("find -delete / -exec / -execdir 能删文件或执行任意命令，要拦", () => {
+		expect(bash("find . -name '*.tmp' -delete")).toBe(true);
+		expect(bash("find . -exec rm {} ;")).toBe(true);
+		expect(bash("find . -execdir cat {} +")).toBe(true);
+		expect(bash("find . -ok rm {} ;")).toBe(true);
+		expect(bash("find . -fprint /tmp/list")).toBe(true);
+	});
+
+	it("find 的纯查找照常放行（B7 之前的实测踩过：cd 串联 find 必须放行）", () => {
+		expect(bash("find . -name '*.c'")).toBe(false);
+		expect(bash("cd sw && find . -type f")).toBe(false);
+		expect(bash("find . -maxdepth 2 -type d")).toBe(false);
+	});
+
+	it("sort -o 会写文件，含粘连与长选项形式", () => {
+		expect(bash("sort -o out.txt in.txt")).toBe(true);
+		expect(bash("sort -uo out.txt in.txt")).toBe(true);
+		expect(bash("sort -oout.txt in.txt")).toBe(true);
+		expect(bash("sort --output=out in")).toBe(true);
+		expect(bash("sort --output out in")).toBe(true);
+	});
+
+	it("sort 的普通用法照常放行", () => {
+		expect(bash("sort -k2 -n in.txt")).toBe(false);
+		expect(bash("sort -T/tmp/foo in.txt")).toBe(false); // -T 的值里有 o，但不是 -o
+		expect(bash("cat x | sort -u")).toBe(false);
+	});
+
+	it("uniq IN OUT：第二个位置参数是输出文件", () => {
+		expect(bash("uniq in.txt out.txt")).toBe(true);
+		expect(bash("uniq -c in.txt out.txt")).toBe(true);
+	});
+
+	it("uniq 的普通用法照常放行，-f/-s/-w 带的数值不算文件", () => {
+		expect(bash("uniq in.txt")).toBe(false);
+		expect(bash("uniq -c in.txt")).toBe(false);
+		expect(bash("uniq -f 2 in.txt")).toBe(false);
+		expect(bash("uniq -s 3 -w 5 in.txt")).toBe(false);
+		expect(bash("cat x | sort | uniq -c")).toBe(false);
+	});
+
+	it("sed 不带 -i 是读文件，放行（B7 里被误拦的就是 sed -n '1,120p'）", () => {
+		expect(bash("sed -n '1,120p' file.md")).toBe(false);
+		expect(bash("sed 's/a/b/' file.c")).toBe(false);
+		expect(bash("sed -n '/-i/p' f")).toBe(false); // 脚本里的 -i 不是选项
+		expect(bash("cat x | sed -e 's/a/b/'")).toBe(false);
+	});
+
+	it("sed -i 会原地改文件，含粘连、带后缀与长选项形式", () => {
+		expect(bash("sed -i 's/a/b/' file.c")).toBe(true);
+		expect(bash("sed -ni 's/a/b/p' file.c")).toBe(true);
+		expect(bash("sed -i.bak 's/a/b/' f")).toBe(true);
+		expect(bash("sed -ie 's/a/b/' f")).toBe(true); // GNU sed：-i 带后缀 e
+		expect(bash("sed --in-place 's/a/b/' f")).toBe(true);
+		expect(bash("sed --in-place=.bak 's/a/b/' f")).toBe(true);
+	});
+
+	it("重定向照旧优先：sed 本身只读，但输出重定向到文件就是写", () => {
+		expect(bash("sed -n 1p f > out")).toBe(true);
+	});
+
+	it("awk 故意不进白名单：写操作藏在脚本里，词法层面看不见", () => {
+		expect(bash("awk '{print}' in.txt")).toBe(true);
+		expect(bash("awk '{print > \"/tmp/out\"}' in.txt")).toBe(true);
+	});
+});

@@ -89,8 +89,10 @@ const READONLY_BASH = new Set([
 	"shasum",
 	"md5sum",
 	"diff",
+	// 下面这几个**带参数就能写文件**，进白名单的前提是 writesByArgs 把那些参数挡住了
 	"sort",
 	"uniq",
+	"sed",
 	"cut",
 	"tr",
 	"date",
@@ -98,6 +100,55 @@ const READONLY_BASH = new Set([
 	"env",
 	"printenv",
 ]);
+
+/**
+ * 白名单里那些**带某个参数就变成写工具**的命令，按参数判。返回原因表示「会写」。
+ *
+ * 白名单的前提是「这个命令不会改变什么」，但不少只读工具带一个开关就能写：
+ * `find` 被当只读放了很久，而 `find . -exec rm {} ;` 能执行任意命令 ——
+ * 那正是 E1（「已获批准」一句话就 `rm -rf`）要防的事，闸门在这条路上一直是漏的。
+ * B7 实测查 `sed -n` 误拦时顺带发现，同时漏的还有 `sort -o` 和 `uniq in out`。
+ *
+ * **往 READONLY_BASH 里加命令之前，先查它有没有能写文件的参数。**
+ *
+ * `awk` 故意不进白名单：它的写操作藏在脚本里（`print > "f"`、`system("rm x")`），
+ * 而脚本是引号包住的一个词，词法层面看不见。宁可让它问一次。
+ */
+function writesByArgs(cmd: string, args: readonly string[]): string | undefined {
+	switch (cmd) {
+		case "find": {
+			const hit = args.find((a) =>
+				["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"].includes(a),
+			);
+			return hit === undefined ? undefined : `find ${hit} 会删文件或执行任意命令`;
+		}
+		case "sed": {
+			// -i 可以粘在别的短选项里（-ni）或直接带后缀（-i.bak、-ie），所以按「短选项字母里含 i」判
+			const hit = args.find((a) => /^-[a-zA-Z]*i/.test(a) || a === "--in-place" || a.startsWith("--in-place="));
+			return hit === undefined ? undefined : `sed ${hit} 会原地改文件`;
+		}
+		case "sort": {
+			// -o 同样可以粘着（-uo out、-oout）
+			const hit = args.find((a) => /^-[a-zA-Z]*o/.test(a) || a === "--output" || a.startsWith("--output="));
+			return hit === undefined ? undefined : `sort ${hit} 会写文件`;
+		}
+		case "uniq": {
+			// `uniq IN OUT`：第二个位置参数是输出文件。-f/-s/-w 各带一个数值，那个数值不算文件
+			const positional: string[] = [];
+			for (let k = 0; k < args.length; k++) {
+				const a = args[k];
+				if (a === "-f" || a === "-s" || a === "-w") {
+					k++;
+					continue;
+				}
+				if (!a.startsWith("-")) positional.push(a);
+			}
+			return positional.length >= 2 ? `uniq 的第二个文件参数 ${positional[1]} 是输出文件` : undefined;
+		}
+		default:
+			return undefined;
+	}
+}
 
 /**
  * shell 关键字，本身不执行外部命令。
@@ -347,6 +398,8 @@ export function classifyToolCall(
 			continue;
 		}
 		if (cmd === "tee" || cmd === "dd") return { writes: true, why: `${cmd} 会写文件` };
+		const argWrite = writesByArgs(cmd, words.slice(i + 1));
+		if (argWrite !== undefined) return { writes: true, why: argWrite };
 		if (!READONLY_BASH.has(cmd)) return { writes: true, why: `${cmd} 不在只读命令白名单里` };
 	}
 

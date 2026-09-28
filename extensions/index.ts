@@ -694,24 +694,28 @@ export default function fnxbus(pi: ExtensionAPI) {
 					details: undefined,
 				};
 			}
+			/**
+			 * 带别人产出的文件：**照常发，只提醒一句**。
+			 *
+			 * 这里原来是硬拒绝，理由写着「否则对方的 gate 会以『不在你的 owns 范围内』拒收」。
+			 * 但 `owns` 早就从拒收条件降级成只标注了——接收侧会照常投递，只在注入文本里标一句
+			 * 「不是它自己的产出」。发送侧没跟着改，**硬拒绝失去了依据**。
+			 *
+			 * B7 实测暴露了后果：DV 想附上 `chip/` 下的设计文件被挡，它把报错理解成「不在
+			 * 本端可写范围」，于是**自己把文件复制到 `dv/handoff/` 再附带**——项目里多出一份
+			 * 副本，源文件一更新它就过期。而 `files` + `sha256` 本来就是为了只传引用、不复制（D2）。
+			 *
+			 * `owns` 是「产出范围」不是权限。引用别人的文件（「按这份 spec 生成」「指着对方的
+			 * 文件说这行有问题」）是正常协作。
+			 *
+			 * 用 gate.ts 的 globMatch，不要在这里另写一份——第一次实地跑就是因为这里手写了个
+			 * 只认前缀的劣化版，把「`a/b/` 后面跟一段通配、再跟 `/docs/**`」这种模式判错了。
+			 */
 			const myOwns = roles[agent]?.owns ?? [];
-			// 用 gate.ts 的 globMatch，不要在这里另写一份——第一次实地跑就是因为
-			// 这里手写了个只认前缀的劣化版，把 `a/b/*/docs/**` 中间那个通配符判错了，
-			// 结果发送方明明有权限却被自己的工具挡住。
-			const notMine = msg.files.filter((f) => !myOwns.some((pattern) => globMatch(pattern, f.path)));
-			if (notMine.length > 0) {
-				// 提前挡住：否则对方的 gate 会以「不在你的 owns 范围内」拒收，白跑一趟
-				return {
-					content: [
-						{
-							type: "text",
-							text: `以下文件不在 ${agent} 的 owns 范围（${myOwns.join(", ")}）内，对方会拒收：\n${notMine.map((f) => `  - ${f.path}`).join("\n")}`,
-						},
-					],
-					isError: true,
-					details: undefined,
-				};
-			}
+			const notMine =
+				myOwns.length === 0
+					? []
+					: msg.files.filter((f) => !myOwns.some((pattern) => globMatch(pattern, f.path))).map((f) => f.path);
 
 			try {
 				for (const t of targets) putMessage(projectRoot, t, msg.id, JSON.stringify({ ...msg, to: t }, null, 2));
@@ -748,9 +752,20 @@ export default function fnxbus(pi: ExtensionAPI) {
 			}
 			const warn =
 				selfCheck.warnings.length > 0 ? `\n提醒：\n${selfCheck.warnings.map((w) => `  - ${w}`).join("\n")}` : "";
+			const foreign =
+				notMine.length > 0
+					? `\n说明：以下文件不在 ${agent} 声明的产出范围（${myOwns.join(", ")}）内，接收方那边会标注「不是它自己的产出」。` +
+						`这不影响投递——引用别人的文件是正常协作，**不需要也不应该为此把文件复制到自己目录下**：\n` +
+						notMine.map((p) => `  - ${p}`).join("\n")
+					: "";
 			const how = params.to === "*" ? `（按订阅扇出到 ${targets.length} 个角色）` : "";
 			return {
-				content: [{ type: "text", text: `已投入 ${targets.join(", ")} 的 inbox${how}，消息 id ${msg.id}${warn}` }],
+				content: [
+					{
+						type: "text",
+						text: `已投入 ${targets.join(", ")} 的 inbox${how}，消息 id ${msg.id}${warn}${foreign}`,
+					},
+				],
 				details: { id: msg.id, to: targets.join(","), type: params.type },
 			};
 		},

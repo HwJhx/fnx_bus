@@ -852,7 +852,12 @@ describe("bus_send：投给谁、不投给谁", () => {
 		pi.fire("session_shutdown");
 	});
 
-	it("带的文件不在自己 owns 范围内：提前挡住，别等对方拒收", async () => {
+	it("带别人产出的文件：照常发出，只提醒一句，并明说不要复制", async () => {
+		/**
+		 * 这里原来断言的是「提前挡住」。B7 实测证明那是错的：DV 想附上 `chip/` 下的设计文件
+		 * 被挡，于是自己把文件复制到 `dv/handoff/` 再附带——制造了会过期的副本。
+		 * 而接收侧早就只标注不拒收了，发送侧的硬拒绝没有依据。
+		 */
 		initProject(fourRoles);
 		mkdirSync(join(root, "pd"), { recursive: true });
 		writeFileSync(join(root, "pd", "theirs.txt"), "不是我的产出", "utf8");
@@ -865,9 +870,62 @@ describe("bus_send：投给谁、不投给谁", () => {
 			files: [{ role: "spec", path: "pd/theirs.txt" }],
 		});
 
-		expect(r.isError).toBe(true);
-		expect(r.content[0].text).toContain("不在 fnx_sw 的 owns 范围");
-		expect(inboxOf("fnx_dv")).toHaveLength(0);
+		expect(r.isError).toBeFalsy();
+		expect(inboxOf("fnx_dv")).toHaveLength(1); // 真的投出去了
+		expect(r.content[0].text).toContain("pd/theirs.txt");
+		expect(r.content[0].text).toContain("不影响投递");
+		expect(r.content[0].text).toContain("不应该为此把文件复制"); // 直接针对 B7 里 DV 犯的错
+		// 引用的是原文件，不是副本
+		const m = JSON.parse(readFileSync(join(root, ".fnxbus", "inbox", "fnx_dv", inboxOf("fnx_dv")[0]), "utf8"));
+		expect(m.files[0].path).toBe("pd/theirs.txt");
+		expect(m.files[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("发送侧放行、接收侧标注「不是它自己的产出」——两边一致", async () => {
+		initProject(fourRoles);
+		mkdirSync(join(root, "pd"), { recursive: true });
+		writeFileSync(join(root, "pd", "theirs.txt"), "不是我的产出", "utf8");
+
+		process.env.FNXBUS_AGENT = "fnx_dv";
+		const sender = boot();
+		await send(sender, {
+			to: "fnx_sw",
+			type: "ip_verified",
+			text: "x",
+			files: [{ role: "spec", path: "pd/theirs.txt" }],
+		});
+		sender.fire("session_shutdown");
+
+		process.env.FNXBUS_AGENT = "fnx_sw";
+		const receiver = boot();
+		expect(receiver.delivered).toHaveLength(1);
+		expect(receiver.delivered[0].content).toContain("不是它自己的产出");
+
+		receiver.fire("session_shutdown");
+	});
+
+	it("自己没声明 owns 时不做这个提醒", async () => {
+		initProject({
+			roles: {
+				fnx_sw: { subscribe: ["ip_verified"], owns: [] },
+				fnx_dv: { subscribe: [], owns: ["dv/**"] },
+			},
+		});
+		mkdirSync(join(root, "pd"), { recursive: true });
+		writeFileSync(join(root, "pd", "x.txt"), "x", "utf8");
+		const pi = boot();
+
+		const r = await send(pi, {
+			to: "fnx_dv",
+			type: "ip_verified",
+			text: "x",
+			files: [{ role: "spec", path: "pd/x.txt" }],
+		});
+
+		expect(r.isError).toBeFalsy();
+		expect(r.content[0].text).not.toContain("产出范围");
 
 		pi.fire("session_shutdown");
 	});
