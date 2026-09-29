@@ -181,13 +181,13 @@ pi 引擎 **>= 0.79.10**。用到这些扩展 API：`on("tool_call")` 返回 `{b
 ## 测试
 
 ```bash
-npm test          # 208 个单测
+npm test          # 210 个单测
 npm run check     # biome + tsgo + 单测
 ```
 
 **测了什么**：[`TESTS.md`](./TESTS.md) —— 单测逐条清单（从 vitest 导出，
 `scripts/gen-test-list.py` 刷新）+ 真机测试跑过什么、还差什么。改动前扫一眼
-「这块有没有被覆盖」比看「208 个全过」有用。
+「这块有没有被覆盖」比看「210 个全过」有用。
 
 `test/extension.test.ts` 用一个**假 pi** 驱动扩展入口，覆盖 drain 的守卫、闸门联动、
 扇出、坏消息隔离。它保护的是「自己的逻辑不退化」，**不能**证明「对 pi 行为的假设仍然成立」

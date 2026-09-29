@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { parseMessage } from "../extensions/contract.ts";
+import { renderInjection } from "../extensions/gate.ts";
 import { classifyToolCall, decideToolCall, freshGuardState, type GuardState, splitShell } from "../extensions/guard.ts";
 
 const writes = (tool: string, input: Record<string, unknown>) => classifyToolCall(tool, input).writes;
@@ -264,5 +266,48 @@ describe("白名单命令的写参数", () => {
 	it("awk 故意不进白名单：写操作藏在脚本里，词法层面看不见", () => {
 		expect(bash("awk '{print}' in.txt")).toBe(true);
 		expect(bash("awk '{print > \"/tmp/out\"}' in.txt")).toBe(true);
+	});
+});
+
+/**
+ * 注入文本末尾那句只读提示（gate.ts）点名了几条命令。SKILL.md 里的同样提示真机上没用——
+ * 模型收到消息那一轮根本不读 SKILL.md——所以挪进了每次必看的注入文本。
+ * 这里钉住两件事：提示真的在；它推荐的命令真的不弹框，否则等于教模型去撞闸门。
+ */
+describe("注入文本里的只读提示和白名单一致", () => {
+	const text = (() => {
+		const r = parseMessage({
+			id: "01HINT",
+			proto: 1,
+			schema: 1,
+			from: "fnx_dv",
+			to: "fnx_sw",
+			type: "ip_verified",
+			text: "x",
+			payload: { verdict: "PASS" },
+			files: [],
+			ts: 1,
+		});
+		if (!r.ok) throw new Error(r.errors.join("; "));
+		return renderInjection(r.message, "PASS");
+	})();
+
+	it("提示在注入文本里，点明 python3 会弹框、别 find /", () => {
+		expect(text).toContain("python3、node 哪怕只是读文件也会被当成写操作");
+		expect(text).toContain("不要 find /");
+	});
+
+	it("它推荐的命令都不弹框，它点名的 python3 / node 确实弹", () => {
+		expect(writes("read", { path: "soc_arch.json" })).toBe(false);
+		for (const c of [
+			"cat soc_arch.json",
+			"head -40 spec.md",
+			"grep -n rcc_bit component.json",
+			"jq keys soc_arch.json",
+		]) {
+			expect(bash(c)).toBe(false);
+		}
+		expect(bash('python3 -c "import json; print(1)"')).toBe(true);
+		expect(bash('node -e "1"')).toBe(true);
 	});
 });

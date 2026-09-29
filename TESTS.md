@@ -1,6 +1,6 @@
 # 测试清单
 
-208 个单测用例，208 通过；外加末尾的真机测试。
+210 个单测用例，210 通过；外加末尾的真机测试。
 
 「N 个测试全过」说明不了测了什么。这份清单的用处是改动前扫一眼
 「这块有没有被覆盖」，不用翻五个测试文件。
@@ -18,11 +18,11 @@ python3 scripts/gen-test-list.py
 | 文件 | 管什么 | 用例数 |
 |---|---|---|
 | [`contract.test.ts`](#contracttestts) | 消息契约 + ②层机制校验 | 42 |
-| [`guard.test.ts`](#guardtestts) | 授权闸门 | 41 |
+| [`guard.test.ts`](#guardtestts) | 授权闸门 | 43 |
 | [`store.test.ts`](#storetestts) | 文件队列 | 38 |
 | [`roles.test.ts`](#rolestestts) | 角色表 | 23 |
 | [`extension.test.ts`](#extensiontestts) | 扩展入口（假 pi 驱动） | 64 |
-| | | **208** |
+| | | **210** |
 
 ---
 
@@ -101,7 +101,7 @@ python3 scripts/gen-test-list.py
 
 ## `guard.test.ts` —— 授权闸门
 
-41 条。工具调用的副作用分类——含一个手写的 shell 词法分析器（用正则判断连踩五次坑：`cd X && find`、`for` 循环、引号里的 `|`、`2>&1`、`2>/dev/null`）——以及放行 / 询问 / 拦截的判定。
+43 条。工具调用的副作用分类——含一个手写的 shell 词法分析器（用正则判断连踩五次坑：`cd X && find`、`for` 循环、引号里的 `|`、`2>&1`、`2>/dev/null`）——以及放行 / 询问 / 拦截的判定。
 
 ### classifyToolCall
 
@@ -155,6 +155,11 @@ python3 scripts/gen-test-list.py
 - sed -i 会原地改文件，含粘连、带后缀与长选项形式
 - 重定向照旧优先：sed 本身只读，但输出重定向到文件就是写
 - awk 故意不进白名单：写操作藏在脚本里，词法层面看不见
+
+### 注入文本里的只读提示和白名单一致
+
+- 提示在注入文本里，点明 python3 会弹框、别 find /
+- 它推荐的命令都不弹框，它点名的 python3 / node 确实弹
 
 ---
 
