@@ -338,3 +338,47 @@ describe("renderInjection", () => {
 		expect(out).not.toContain("verdict: CONDITIONAL_PASS");
 	});
 });
+
+/**
+ * 多轮实测：轮次写在 `payload.round`，接收方的注入文本里没有它，模型找不到 N，链停在第一跳。
+ * 契约允许 payload 带任意字段，那模型就得看得到。
+ */
+describe("renderInjection：payload 的其他字段要让模型看到", () => {
+	const render = (payload: Record<string, unknown>): string => {
+		const r = parseMessage(validRaw({ payload }));
+		if (!r.ok) throw new Error(r.errors.join("; "));
+		return renderInjection(r.message, "PASS");
+	};
+
+	it("固定四项以外的字段原样列出，嵌套的也在", () => {
+		const out = render({ ip: "crc", verdict: "PASS", round: 1, rcc: { reg: "RCC_AHBENR", bit: 2 } });
+		expect(out).toContain("payload 里的其他字段");
+		expect(out).toContain('"round": 1');
+		expect(out).toContain('"reg": "RCC_AHBENR"');
+		expect(out).toContain('"bit": 2');
+	});
+
+	it("列在分隔线上面：那是发送方原样给的，不能和总线的结论混在一起", () => {
+		const out = render({ verdict: "PASS", round: 1 });
+		expect(out.indexOf('"round": 1')).toBeLessThan(out.indexOf("── 以下由总线校验后给出"));
+		expect(out).toContain("总线没有校验");
+	});
+
+	it("已经在下面列过的不重复列；verdict 只给校验后的值", () => {
+		const out = render({ ip: "crc", verdict: "PASS", message: "m", missing: ["a"] });
+		expect(out).not.toContain("其他字段");
+	});
+
+	it("固定字段类型不对、下面没列出来的，也归到其他字段里，不能丢", () => {
+		const out = render({ ip: 5, verdict: "PASS" });
+		expect(out).not.toContain("ip: 5");
+		expect(out).toContain('"ip": 5');
+	});
+
+	it("太长就截断并说明，免得一条消息撑爆上下文", () => {
+		const out = render({ verdict: "PASS", blob: "x".repeat(10_000) });
+		expect(out).toContain("已截断");
+		expect(out).toContain("用 files 引用");
+		expect(out.length).toBeLessThan(6000);
+	});
+});

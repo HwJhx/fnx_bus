@@ -35,7 +35,7 @@ import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CONTRACT, PROTO, parseMessage } from "./contract.ts";
-import { decide, type GateContext, globMatch, renderInjection } from "./gate.ts";
+import { DUP_WINDOW_MS, decide, type GateContext, globMatch, renderInjection } from "./gate.ts";
 import { classifyToolCall, decideToolCall, freshGuardState } from "./guard.ts";
 import { findOwnsOverlaps, mergeRoles, parseRolesFile, type Role, rolesTemplate, validateAgentName } from "./roles.ts";
 import {
@@ -97,6 +97,36 @@ export default function fnxbus(pi: ExtensionAPI) {
 	let seen: SeenIndex = { ids: new Set<string>(), recent: [] };
 	let extraReadonly: ReadonlySet<string> = new Set<string>();
 	let sentIds = new Set<string>();
+	/**
+	 * 本会话发出过的内容指纹：`接收方 + 指纹` → 那条的 id 与发出时刻。
+	 *
+	 * 接收侧按内容去重（gate.ts 的 `DUP_WINDOW_MS`）：同一发送方、同类型、同 payload，
+	 * 2 分钟内的第二条直接丢，**不告诉发送方**。多轮实测里 DV 隔 30 秒合法地「再问一遍」，
+	 * 回执说已投入，SW 从没看到，两边都没提示。
+	 *
+	 * 接收侧那道不能松（它挡的是措辞不同、payload 相同的 ack 来回），所以在发送侧用同一个
+	 * 窗口、同一个指纹提前拦下，当场告诉模型怎么改。只在内存里：重启后 2 分钟内的重复
+	 * 这里拦不住，接收侧照样丢——少见，接受。
+	 */
+	const sentFingerprints = new Map<string, { id: string; ts: number }>();
+	/** 这条要是发给 `targets`，哪些会被对方当成重复丢掉。 */
+	const dupSends = (targets: string[], fp: string): { to: string; id: string; agoS: number }[] => {
+		const now = Date.now();
+		const out: { to: string; id: string; agoS: number }[] = [];
+		for (const to of targets) {
+			const prev = sentFingerprints.get(`${to}\n${fp}`);
+			if (prev !== undefined && now - prev.ts < DUP_WINDOW_MS) {
+				out.push({ to, id: prev.id, agoS: Math.round((now - prev.ts) / 1000) });
+			}
+		}
+		return out;
+	};
+	/** 拒发时给模型的话：说清为什么、对方会怎样、怎么改。 */
+	const dupRefusal = (dups: { to: string; id: string; agoS: number }[]): string =>
+		"没有发出：" +
+		dups.map((d) => `你 ${d.agoS} 秒前刚给 ${d.to} 发过内容相同的一条（${d.id}）`).join("；") +
+		`。type 和 payload 都一样，对方会在 ${DUP_WINDOW_MS / 1000} 秒内把它当重复直接丢掉，也不会告诉你。` +
+		"如果是要再问一遍或再发一次，在 payload 里加一个区分字段（例如 attempt: 2）再发；只改 text 不算不同。";
 	let watcher: FSWatcher | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	/**
@@ -441,6 +471,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 
 		seen = loadSeen(projectRoot, agent);
 		sentIds = loadSentIds(projectRoot, agent);
+		sentFingerprints.clear();
 		const inboxDir = join(busDir(projectRoot), "inbox", agent);
 		mkdirSync(inboxDir, { recursive: true });
 
@@ -747,6 +778,20 @@ export default function fnxbus(pi: ExtensionAPI) {
 					? []
 					: msg.files.filter((f) => !myOwns.some((pattern) => globMatch(pattern, f.path))).map((f) => f.path);
 
+			const fp = fingerprint(params.type, agent, selfCheck.message.payload);
+			const dups = dupSends(targets, fp);
+			if (dups.length > 0) {
+				appendLog(projectRoot, {
+					ts: Date.now(),
+					event: "dup_refused",
+					from: agent,
+					to: dups.map((d) => d.to).join(","),
+					type: params.type,
+					note: `与 ${dups.map((d) => d.id).join(",")} 内容相同`,
+				});
+				return { content: [{ type: "text", text: dupRefusal(dups) }], isError: true, details: undefined };
+			}
+
 			try {
 				for (const t of targets) putMessage(projectRoot, t, msg.id, JSON.stringify({ ...msg, to: t }, null, 2));
 			} catch (e) {
@@ -770,6 +815,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 			}
 			appendSent(projectRoot, agent, msg.id, targets.join(","));
 			sentIds.add(msg.id);
+			for (const t of targets) sentFingerprints.set(`${t}\n${fp}`, { id: msg.id, ts: Date.now() });
 			for (const t of targets) {
 				appendLog(projectRoot, {
 					ts: Date.now(),
@@ -882,6 +928,19 @@ export default function fnxbus(pi: ExtensionAPI) {
 					details: undefined,
 				};
 			}
+			const fp = fingerprint(params.type, agent, selfCheck.message.payload);
+			const dups = dupSends([to], fp);
+			if (dups.length > 0) {
+				appendLog(projectRoot, {
+					ts: Date.now(),
+					event: "dup_refused",
+					from: agent,
+					to,
+					type: params.type,
+					note: `与 ${dups[0].id} 内容相同`,
+				});
+				return { content: [{ type: "text", text: dupRefusal(dups) }], isError: true, details: undefined };
+			}
 			try {
 				putMessage(projectRoot, to, msg.id, JSON.stringify(msg, null, 2));
 			} catch (e) {
@@ -899,6 +958,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 			}
 			appendSent(projectRoot, agent, msg.id, to);
 			sentIds.add(msg.id);
+			sentFingerprints.set(`${to}\n${fp}`, { id: msg.id, ts: Date.now() });
 			appendLog(projectRoot, {
 				ts: Date.now(),
 				event: "sent",

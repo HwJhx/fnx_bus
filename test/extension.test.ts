@@ -38,7 +38,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fnxbus from "../extensions/index.ts";
 
 /** 假 ctx。只造 `index.ts` 真正用到的那几个成员（`pi.*` 四个方法、`ctx` 七个成员）。 */
@@ -1107,6 +1107,179 @@ describe("内容去重（这个坑踩过两次，钉住它）", () => {
 		expect(logEvents()).not.toContain("log_only");
 
 		pi.fire("session_shutdown");
+	});
+});
+
+/**
+ * 多轮实测 A6：DV 隔 30 秒合法地「再问一遍」（payload 一样、text 不一样），
+ * 回执说已投入，SW 那边被内容去重丢了，两边都没提示。
+ *
+ * 接收侧那道不松（它挡的是措辞不同、payload 相同的 ack 来回），改成发送侧用同一个窗口
+ * 提前拦下，当场告诉模型。
+ */
+describe("发送侧提前拦下会被对方当重复丢掉的消息", () => {
+	const twoRoles = {
+		roles: {
+			fnx_sw: { subscribe: ["need_input"], owns: ["sw/**"] },
+			fnx_dv: { subscribe: ["need_input"], owns: ["dv/**"] },
+			fnx_pd: { subscribe: ["need_input"], owns: ["pd/**"] },
+		},
+	};
+	const tool = (pi: FakePi, name: string) => {
+		const t = pi.tools.get(name);
+		if (t === undefined) throw new Error(`${name} 没注册`);
+		return t;
+	};
+	const ask = { type: "need_input", payload: { ip: "crc", verdict: "BLOCKED", missing: ["rcc_bit"] } };
+	const inboxOf = (role: string): string[] => {
+		const dir = join(root, ".fnxbus", "inbox", role);
+		return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
+	};
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("2 分钟内给同一个人发 payload 相同的：不发出，说清原因和改法", async () => {
+		initProject(twoRoles);
+		const pi = boot();
+		const send = tool(pi, "bus_send");
+
+		const first = await send.execute("c1", { to: "fnx_dv", text: "第一次问", ...ask });
+		const second = await send.execute("c2", { to: "fnx_dv", text: "第二次问：上一条可能漏看了", ...ask });
+
+		expect(first.isError).toBeFalsy();
+		expect(second.isError).toBe(true);
+		expect(second.content[0].text).toContain("没有发出");
+		expect(second.content[0].text).toContain("当重复直接丢掉");
+		expect(second.content[0].text).toContain("attempt");
+		expect(second.content[0].text).toContain("只改 text 不算不同");
+		expect(inboxOf("fnx_dv")).toHaveLength(1);
+		expect(logEvents()).toContain("dup_refused");
+
+		pi.fire("session_shutdown");
+	});
+
+	it("按提示在 payload 里加个区分字段，就能发出去", async () => {
+		initProject(twoRoles);
+		const pi = boot();
+		const send = tool(pi, "bus_send");
+
+		await send.execute("c1", { to: "fnx_dv", text: "第一次问", ...ask });
+		const again = await send.execute("c2", {
+			to: "fnx_dv",
+			text: "再问一遍",
+			type: ask.type,
+			payload: { ...ask.payload, attempt: 2 },
+		});
+
+		expect(again.isError).toBeFalsy();
+		expect(inboxOf("fnx_dv")).toHaveLength(2);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("发给别人不算重复：去重是按接收方算的", async () => {
+		initProject(twoRoles);
+		const pi = boot();
+		const send = tool(pi, "bus_send");
+
+		await send.execute("c1", { to: "fnx_dv", text: "问 dv", ...ask });
+		const other = await send.execute("c2", { to: "fnx_pd", text: "问 pd", ...ask });
+
+		expect(other.isError).toBeFalsy();
+		expect(inboxOf("fnx_pd")).toHaveLength(1);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("过了 2 分钟就不拦了，和接收侧的窗口一致", async () => {
+		initProject(twoRoles);
+		const pi = boot();
+		const send = tool(pi, "bus_send");
+		const t0 = Date.now();
+
+		await send.execute("c1", { to: "fnx_dv", text: "第一次问", ...ask });
+		vi.spyOn(Date, "now").mockReturnValue(t0 + 121_000);
+		const later = await send.execute("c2", { to: "fnx_dv", text: "两分钟后再问", ...ask });
+
+		expect(later.isError).toBeFalsy();
+		expect(inboxOf("fnx_dv")).toHaveLength(2);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("扇出也拦：要投的角色里有一个会当重复，整条不发", async () => {
+		initProject(twoRoles);
+		const pi = boot();
+		const send = tool(pi, "bus_send");
+
+		await send.execute("c1", { to: "fnx_dv", text: "先单独问 dv", ...ask });
+		const fan = await send.execute("c2", { to: "*", text: "再问所有人", ...ask });
+
+		expect(fan.isError).toBe(true);
+		expect(fan.content[0].text).toContain("fnx_dv");
+		expect(inboxOf("fnx_pd")).toHaveLength(0);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("bus_reply 同样拦", async () => {
+		initProject(twoRoles);
+		putInbox("01ASKREPLY1", { type: "need_input", payload: { verdict: "BLOCKED", missing: ["x"] } });
+		const pi = boot();
+		expect(pi.delivered).toHaveLength(1);
+		const reply = tool(pi, "bus_reply");
+		const ack = { message_id: "01ASKREPLY1", type: "need_input", payload: { verdict: "PASS" } };
+
+		const first = await reply.execute("c1", { ...ack, text: "收到" });
+		const second = await reply.execute("c2", { ...ack, text: "好的，收到了" });
+
+		expect(first.isError).toBeFalsy();
+		expect(second.isError).toBe(true);
+		expect(second.content[0].text).toContain("没有发出");
+		expect(inboxOf("fnx_dv")).toHaveLength(1);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("局限：发送方重启后记录清空，拦不住，接收侧照样丢（接受的取舍，钉住它）", async () => {
+		initProject(twoRoles);
+		process.env.FNXBUS_AGENT = "fnx_dv";
+		const a = boot();
+		await tool(a, "bus_send").execute("c1", { to: "fnx_sw", text: "第一次问", ...ask });
+		a.fire("session_shutdown");
+		const b = boot();
+		const again = await tool(b, "bus_send").execute("c2", { to: "fnx_sw", text: "重启后再问", ...ask });
+		b.fire("session_shutdown");
+		expect(again.isError).toBeFalsy();
+
+		process.env.FNXBUS_AGENT = "fnx_sw";
+		const receiver = boot();
+		expect(receiver.delivered).toHaveLength(1);
+		expect(logEvents()).toContain("log_only");
+
+		receiver.fire("session_shutdown");
+	});
+
+	it("payload 的自定义字段一路送到对方模型眼前（多轮实测里 round 就丢在这）", async () => {
+		initProject(twoRoles);
+		process.env.FNXBUS_AGENT = "fnx_dv";
+		const sender = boot();
+		await tool(sender, "bus_send").execute("c1", {
+			to: "fnx_sw",
+			type: "need_input",
+			text: "收到 round=N 的消息后回 N+1",
+			payload: { verdict: "BLOCKED", missing: ["relay"], round: 3 },
+		});
+		sender.fire("session_shutdown");
+
+		process.env.FNXBUS_AGENT = "fnx_sw";
+		const receiver = boot();
+		expect(receiver.delivered).toHaveLength(1);
+		expect(receiver.delivered[0].content).toContain('"round": 3');
+
+		receiver.fire("session_shutdown");
 	});
 });
 

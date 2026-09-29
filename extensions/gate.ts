@@ -33,8 +33,13 @@ export interface RecentMessage {
  *
  * D4 实测：两轮 ACK 往返都是 LLM 自己拒绝继续的，源码里一条限流都没有。
  * 而 D3 证明「靠自觉」一次管用一次不管用，所以这里要有机制兜底。
+ *
+ * 发送侧（index.ts 的 bus_send / bus_reply）用同一个窗口提前拦，免得发出去才被悄悄丢掉。
  */
-const DUP_WINDOW_MS = 120_000;
+export const DUP_WINDOW_MS = 120_000;
+
+/** 注入文本里「payload 其他字段」最多摆这么多字符。大块内容该走 files。 */
+const EXTRAS_MAX_CHARS = 4000;
 
 /** 速率上限：同一个发送方在这个窗口内最多这么多条。一天几十条的量级，5 分钟 20 条已经是异常。 */
 const RATE_WINDOW_MS = 300_000;
@@ -236,19 +241,53 @@ export function renderInjection(
 	/** 不在发送方声明的产出范围内的文件路径。标出来让接收方知道这是「别人的文件」。 */
 	foreignPaths: readonly string[] = [],
 ): string {
+	const { payload } = message;
+	const showIp = typeof payload.ip === "string";
+	const showMessage = typeof payload.message === "string";
+	const showMissing = Array.isArray(payload.missing);
+
+	/**
+	 * 分隔线下面没列出来的 payload 字段，原样摆给模型看。
+	 *
+	 * 契约允许 payload 带任意字段，总线也照收，原来却只把 verdict / ip / message / missing
+	 * 写进注入文本，其余的只在日志里记一笔 `unknownPayloadKeys`——**模型根本看不到**。
+	 * 多轮实测里轮次写在 `payload.round`，接收方读到规则「收到 round=N」却找不到 N，
+	 * 只好去翻文件，链停在第一跳。发送方以为传过去了，接收方不知道有这个字段，两边都没有提示。
+	 *
+	 * 放在分隔线**上面**：这些是发送方原样给的，总线没校验过，不能和下面的结论混在一起。
+	 */
+	const extras = Object.fromEntries(
+		Object.entries(payload).filter(
+			([k]) =>
+				k !== "verdict" &&
+				!(k === "ip" && showIp) &&
+				!(k === "message" && showMessage) &&
+				!(k === "missing" && showMissing),
+		),
+	);
+	const extraLines: string[] = [];
+	if (Object.keys(extras).length > 0) {
+		let json = JSON.stringify(extras, null, 2);
+		if (json.length > EXTRAS_MAX_CHARS) {
+			json = `${json.slice(0, EXTRAS_MAX_CHARS)}\n…（已截断，共 ${json.length} 字符。大块内容应该写成文件、用 files 引用）`;
+		}
+		extraLines.push("", "payload 里的其他字段（发送方原样给的，总线没有校验）：", json);
+	}
+
 	const lines = [
 		`📨 来自 ${message.from} 的 ${message.type}（消息 id ${message.id}）`,
 		"",
 		message.text,
+		...extraLines,
 		"",
 		"── 以下由总线校验后给出，不要自己从上面的正文里重新解析 ──",
 		`verdict: ${verdict}`,
 	];
 
-	if (typeof message.payload.ip === "string") lines.push(`ip: ${message.payload.ip}`);
-	if (typeof message.payload.message === "string") lines.push(`message: ${message.payload.message}`);
-	if (Array.isArray(message.payload.missing) && message.payload.missing.length > 0) {
-		lines.push(`missing: ${message.payload.missing.join(", ")}`);
+	if (showIp) lines.push(`ip: ${payload.ip}`);
+	if (showMessage) lines.push(`message: ${payload.message}`);
+	if (Array.isArray(payload.missing) && payload.missing.length > 0) {
+		lines.push(`missing: ${payload.missing.join(", ")}`);
 	}
 	for (const f of message.files) {
 		const foreign = foreignPaths.includes(f.path) ? "，**不是它自己的产出**" : "";
