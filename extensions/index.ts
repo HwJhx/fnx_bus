@@ -106,6 +106,11 @@ export default function fnxbus(pi: ExtensionAPI) {
 	let sessionCtx: ExtensionContext | undefined;
 	/** 初始化失败的原因。失败时扩展不工作，但要让人看得见，不能静默。 */
 	let initError = "";
+	/**
+	 * 这个目录不是总线项目（没有 `.fnxbus/`，也没设 FNXBUS_PROJECT）。
+	 * 和「是总线项目但配坏了」分开：前者安静不接入，后者必须报警。见 session_start 开头。
+	 */
+	let notBusProject = false;
 	let draining = false;
 	const guard = freshGuardState();
 	/** 闸门打开的时刻，用于算「从注入到处理完」的耗时（F4）。 */
@@ -339,6 +344,31 @@ export default function fnxbus(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionCtx = ctx;
+		// 同一个进程里切换会话会再触发一次 session_start，上一次的结论不能沿用
+		initError = "";
+		notBusProject = false;
+
+		/**
+		 * 先判断「这是不是总线项目」，不是就**安静地**不接入。
+		 *
+		 * 总线是可选扩展：装了它的 agent 在任何目录启动都会加载它，而绝大多数目录跟多 agent 协作
+		 * 无关。原来这里一律报警（「无法确定项目根，拒绝注册」前后打两遍），在
+		 * `~/.forenyx/<agent>/agent` 这种目录里启动也报——纯噪音。
+		 *
+		 * 判断标准是有没有 `.fnxbus/`（或显式设了 FNXBUS_PROJECT）。**只有 `.git` 不算**：
+		 * 有 git 不等于在用总线。一旦是总线项目，后面任何问题（角色表缺失或写错、没有本端、
+		 * 单实例锁被占）都照旧报警——那种情况不出声，就是「收不到消息、谁也不知道」。
+		 *
+		 * 这一步必须在确定角色名之前：否则非总线目录里没设 FNXBUS_AGENT 也会报警。
+		 */
+		const explicitRoot = process.env.FNXBUS_PROJECT;
+		if ((explicitRoot === undefined || explicitRoot.length === 0) && findInitializedRoot(ctx.cwd) === undefined) {
+			notBusProject = true;
+			initError = "这个目录（及上层）没有 .fnxbus/，不是总线项目。要用多 agent 协作，在项目里跑 /bus-setup 初始化。";
+			ctx.ui.setStatus("fnxbus", undefined);
+			return;
+		}
+
 		agent = process.env.FNXBUS_AGENT ?? process.env.FORENYX_AGENT_NAME ?? "";
 		if (agent.length === 0) {
 			failInit(ctx, "未能确定本端角色名。请设 FNXBUS_AGENT=<角色名>，要和 roles.json 里的键一致。");
@@ -1088,6 +1118,11 @@ export default function fnxbus(pi: ExtensionAPI) {
 	pi.registerCommand("bus-status", {
 		description: "fnxbus：项目根、角色、闸门状态、积压",
 		handler: async (_args, ctx) => {
+			// 不是总线项目不算出错——人主动来问，就告诉他怎么开始用
+			if (notBusProject) {
+				ctx.ui.notify(`fnxbus：${initError}`, "info");
+				return;
+			}
 			if (initError.length > 0) {
 				ctx.ui.notify(`fnxbus 未启用：\n${initError}`, "error");
 				return;

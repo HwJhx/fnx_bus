@@ -76,11 +76,15 @@ interface FakePi {
 	tools: Map<string, FakeTool>;
 	/** 注册进来的命令名。 */
 	commands: string[];
+	/** 注册进来的命令处理函数，按命令名存。 */
+	commandHandlers: Map<string, (args: string, ctx: FakeCtx) => Promise<void>>;
 	/** `sendUserMessage` 的调用记录——「投递了几次、投了什么」。 */
 	delivered: { content: string; deliverAs?: string }[];
 	/** 让下一次 `sendUserMessage` 抛这个错，用来测「投递失败时记账已经落盘了没」。 */
 	deliverThrows?: Error;
 	notified: string[];
+	/** 与 notified 一一对应的级别（info / warning / error）。 */
+	notifyLevels: string[];
 	status: Map<string, string>;
 	/** 闸门弹框时点哪个选项。默认点最后一个（「拒绝」）。 */
 	selectAnswer?: string;
@@ -101,8 +105,10 @@ function makeFakePi(root: string, opts: { hasUI?: boolean; idle?: boolean } = {}
 	const handlers = new Map<string, Handler>();
 	const tools = new Map<string, FakeTool>();
 	const commands: string[] = [];
+	const commandHandlers = new Map<string, (args: string, ctx: FakeCtx) => Promise<void>>();
 	const delivered: { content: string; deliverAs?: string }[] = [];
 	const notified: string[] = [];
+	const notifyLevels: string[] = [];
 	const status = new Map<string, string>();
 	const selected: { message: string; options: string[] }[] = [];
 
@@ -111,7 +117,10 @@ function makeFakePi(root: string, opts: { hasUI?: boolean; idle?: boolean } = {}
 		hasUI: opts.hasUI ?? true,
 		isIdle: () => opts.idle ?? true,
 		ui: {
-			notify: (m) => notified.push(m),
+			notify: (m, level) => {
+				notified.push(m);
+				notifyLevels.push(level ?? "info");
+			},
 			setStatus: (k, v) => status.set(k, v),
 			select: async (message, options) => {
 				selected.push({ message, options });
@@ -125,8 +134,10 @@ function makeFakePi(root: string, opts: { hasUI?: boolean; idle?: boolean } = {}
 		handlers,
 		tools,
 		commands,
+		commandHandlers,
 		delivered,
 		notified,
+		notifyLevels,
 		status,
 		selected,
 		ctx,
@@ -138,8 +149,9 @@ function makeFakePi(root: string, opts: { hasUI?: boolean; idle?: boolean } = {}
 			registerTool: (tool: FakeTool) => {
 				tools.set(tool.name, tool);
 			},
-			registerCommand: (name: string) => {
+			registerCommand: (name: string, config: { handler: (args: string, ctx: FakeCtx) => Promise<void> }) => {
 				commands.push(name);
+				commandHandlers.set(name, config.handler);
 			},
 			sendUserMessage: (content: string, options?: { deliverAs?: string }) => {
 				if (fake.deliverThrows !== undefined) throw fake.deliverThrows;
@@ -159,6 +171,8 @@ const savedProject = process.env.FNXBUS_PROJECT;
  * 「总线为什么没工作」无从查）。测试里把它静音，否则几屏噪音会盖住真正的失败信息。
  */
 const realStderrWrite = process.stderr.write.bind(process.stderr);
+/** 测试期间写到 stderr 的内容（原样吞掉不输出，但留下来给断言用）。 */
+let stderrWrites: string[] = [];
 
 /** 建一个已初始化的项目根：`.fnxbus/` 下有 project.json 与 roles.json。 */
 function initProject(roles?: unknown): void {
@@ -238,7 +252,11 @@ beforeEach(() => {
 	process.env.FNXBUS_AGENT = "fnx_sw";
 	// 项目根一律显式指定：否则会向上找 .git，在仓库里跑测试时会认到仓库根上去
 	process.env.FNXBUS_PROJECT = root;
-	process.stderr.write = (() => true) as typeof process.stderr.write;
+	stderrWrites = [];
+	process.stderr.write = ((chunk: unknown) => {
+		stderrWrites.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
 });
 
 afterEach(() => {
@@ -1089,5 +1107,143 @@ describe("内容去重（这个坑踩过两次，钉住它）", () => {
 		expect(logEvents()).not.toContain("log_only");
 
 		pi.fire("session_shutdown");
+	});
+});
+
+/**
+ * 总线是可选扩展：装了它的 agent 在任何目录启动都会加载它，绝大多数目录跟多 agent 协作无关。
+ * 原来一律报警（在 ~/.forenyx/<agent>/agent 里启动也打两遍「无法确定项目根」）——纯噪音。
+ *
+ * 分界线是有没有 `.fnxbus/`：没有就完全不出声；有了，后面任何问题照旧报警。
+ */
+describe("不是总线项目时完全不出声", () => {
+	const sendVia = (pi: FakePi) => {
+		const tool = pi.tools.get("bus_send");
+		if (tool === undefined) throw new Error("bus_send 没注册");
+		return tool.execute("c", { to: "fnx_dv", type: "ip_verified", text: "x" });
+	};
+
+	it("没有 .fnxbus/、也没设 FNXBUS_PROJECT：不报警、不写 stderr、不占状态栏、不注册、不建目录", () => {
+		delete process.env.FNXBUS_PROJECT;
+
+		const pi = boot();
+
+		expect(pi.notified).toEqual([]);
+		expect(stderrWrites).toEqual([]);
+		expect(pi.status.get("fnxbus")).toBeUndefined();
+		expect(logEvents()).toEqual([]);
+		expect(existsSync(join(root, ".fnxbus"))).toBe(false);
+	});
+
+	it("只有 .git、没有 .fnxbus/：同样不出声——有 git 不等于在用总线", () => {
+		delete process.env.FNXBUS_PROJECT;
+		mkdirSync(join(root, ".git"));
+
+		const pi = boot();
+
+		expect(pi.notified).toEqual([]);
+		expect(stderrWrites).toEqual([]);
+		expect(existsSync(join(root, ".fnxbus"))).toBe(false);
+	});
+
+	it("非总线目录里角色名没设或不合规也不出声——先判断是不是总线项目，再查角色名", () => {
+		delete process.env.FNXBUS_PROJECT;
+		for (const name of ["", "../../etc"]) {
+			process.env.FNXBUS_AGENT = name;
+			const pi = boot();
+			expect(pi.notified).toEqual([]);
+		}
+		expect(stderrWrites).toEqual([]);
+	});
+
+	it("工具如实说「不是总线项目」，不假装发出去了", async () => {
+		delete process.env.FNXBUS_PROJECT;
+		const pi = boot();
+
+		const r = await sendVia(pi);
+
+		expect(r.isError).toBe(true);
+		expect(r.content[0].text).toContain("不是总线项目");
+		expect(r.content[0].text).toContain("/bus-setup");
+	});
+
+	it("/bus-status 告诉人怎么开始用", async () => {
+		delete process.env.FNXBUS_PROJECT;
+		const pi = boot();
+
+		await pi.commandHandlers.get("bus-status")?.("", pi.ctx);
+
+		expect(pi.notified.join("\n")).toContain("不是总线项目");
+		expect(pi.notified.join("\n")).toContain("/bus-setup");
+		// 不是总线项目不算出错：人主动来问，给提示而不是报错
+		expect(pi.notifyLevels).toEqual(["info"]);
+		expect(pi.notified.join("\n")).not.toContain("未启用");
+	});
+
+	it("/bus-setup 照样可用——初始化的入口不能跟着一起安静掉", () => {
+		delete process.env.FNXBUS_PROJECT;
+		const pi = boot();
+
+		expect(pi.commands).toContain("bus-setup");
+	});
+});
+
+describe("是总线项目但配坏了：照旧报警", () => {
+	it("靠向上查找认出的总线项目（没设 FNXBUS_PROJECT），缺角色表照旧报警", () => {
+		delete process.env.FNXBUS_PROJECT;
+		mkdirSync(join(root, ".fnxbus"), { recursive: true });
+		writeFileSync(join(root, ".fnxbus", "project.json"), "{}", "utf8");
+
+		const pi = boot();
+
+		expect(pi.status.get("fnxbus")).toContain("未接入");
+		expect(pi.notified.join("\n")).toContain("roles.json");
+		// -p 模式看不见 notify，stderr 那一份也要在（I1 实测：静默拒绝注册时无从查起）
+		expect(stderrWrites.join("")).toContain("fnxbus 未启用");
+	});
+
+	it("总线项目里没有本端角色：照旧报警——更可能是漏加了，不是故意不参与", () => {
+		delete process.env.FNXBUS_PROJECT;
+		initProject({ roles: { fnx_dv: { subscribe: [], owns: [] } } });
+
+		const pi = boot();
+
+		expect(pi.status.get("fnxbus")).toContain("未接入");
+		expect(pi.notified.join("\n")).toContain("fnx_sw");
+	});
+
+	it("切换会话要重新判断：上次启动失败、修好之后再切一次，要能正常接入并投递", () => {
+		// 真正会出事的方向：不清零的话上次的 initError 留着，注册明明成功了，drain 却永远不干活
+		delete process.env.FNXBUS_PROJECT;
+		mkdirSync(join(root, ".fnxbus"), { recursive: true });
+		writeFileSync(join(root, ".fnxbus", "project.json"), "{}", "utf8");
+		const pi = boot();
+		expect(pi.status.get("fnxbus")).toContain("未接入");
+
+		initProject(); // 补上角色表
+		putInbox("01FIXED0SW01");
+		pi.fire("session_start");
+
+		expect(pi.status.get("fnxbus")).toContain("fnx_sw");
+		expect(pi.delivered).toHaveLength(1);
+
+		pi.fire("session_shutdown");
+	});
+
+	it("切换会话要重新判断：从配坏的总线项目切到非总线目录，不沿用上次的报警", async () => {
+		delete process.env.FNXBUS_PROJECT;
+		mkdirSync(join(root, ".fnxbus"), { recursive: true });
+		writeFileSync(join(root, ".fnxbus", "project.json"), "{}", "utf8");
+		const pi = boot();
+		expect(pi.notified.length).toBeGreaterThan(0);
+
+		rmSync(join(root, ".fnxbus"), { recursive: true, force: true });
+		pi.notified.length = 0;
+		pi.fire("session_start");
+
+		expect(pi.notified).toEqual([]);
+		const tool = pi.tools.get("bus_send");
+		const r = await tool?.execute("c", { to: "fnx_dv", type: "x", text: "x" });
+		expect(r?.content[0].text).toContain("不是总线项目");
 	});
 });
