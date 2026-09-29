@@ -141,6 +141,8 @@ export default function fnxbus(pi: ExtensionAPI) {
 	 * 和「是总线项目但配坏了」分开：前者安静不接入，后者必须报警。见 session_start 开头。
 	 */
 	let notBusProject = false;
+	/** 没有 UI 的会话（`-p` / json）：只发不收，不占锁、不写名片。见 session_start。 */
+	let sendOnly = false;
 	let draining = false;
 	const guard = freshGuardState();
 	/** 闸门打开的时刻，用于算「从注入到处理完」的耗时（F4）。 */
@@ -325,6 +327,10 @@ export default function fnxbus(pi: ExtensionAPI) {
 				const from = parsed.ok ? parsed.message.from : "";
 				const type = parsed.ok ? parsed.message.type : "";
 				const fp = parsed.ok ? fingerprint(type, from, parsed.message.payload) : "";
+				// 同名角色的 `-p` 实例也往 sent/ 里记（只发不收），对方回复它的消息会进本实例的 inbox。
+				// 内存里的 sentIds 是启动时读的，没有那些 id，不重读就会把正常回复标成「对不上号」。
+				const replyTo = parsed.ok ? parsed.message.reply_to : null;
+				if (replyTo !== null && !sentIds.has(replyTo)) sentIds = loadSentIds(projectRoot, agent);
 				const d = decide(parsed, gateContextFor(from, type, fp));
 
 				appendLog(projectRoot, {
@@ -377,6 +383,7 @@ export default function fnxbus(pi: ExtensionAPI) {
 		// 同一个进程里切换会话会再触发一次 session_start，上一次的结论不能沿用
 		initError = "";
 		notBusProject = false;
+		sendOnly = false;
 
 		/**
 		 * 先判断「这是不是总线项目」，不是就**安静地**不接入。
@@ -461,6 +468,31 @@ export default function fnxbus(pi: ExtensionAPI) {
 			});
 		}
 
+		/**
+		 * 没有 UI（`-p` / json）：**只发不收**，所以不抢锁、不写名片、不起 watcher。
+		 *
+		 * 锁是防两个实例抢同一个 inbox 重复处理的，而这种模式本来就不取消息（见 drain 开头）。
+		 * 原来它照样抢锁，于是交互模式的同名 agent 开着时，`-p` 接不上总线、**连消息都发不出**；
+		 * 反过来 `-p` 跑着的那几分钟里，交互模式也起不来。`-p` 恰恰是脚本里「跑完通知对方」的用法。
+		 *
+		 * 名片也不写：名片表示「这个角色在线、能收消息」，`-p` 不收；而且名片按角色名一个文件，
+		 * 写了会盖掉交互实例的，退出时删了又会把交互实例的删掉。
+		 */
+		sendOnly = !ctx.hasUI;
+		if (sendOnly) {
+			seen = loadSeen(projectRoot, agent);
+			sentIds = loadSentIds(projectRoot, agent);
+			sentFingerprints.clear();
+			appendLog(projectRoot, {
+				ts: Date.now(),
+				event: "registered",
+				from: agent,
+				note: `${projectRoot}（没有 UI，只发不收：不占锁、不写名片、不取消息）`,
+			});
+			ctx.ui.setStatus("fnxbus", `🚌 ${agent}（只发）`);
+			return;
+		}
+
 		const holder = acquireLock(projectRoot, agent);
 		if (holder !== undefined) {
 			// A3：同一个角色只允许一个实例接总线。两个实例抢同一个 inbox 会重复处理
@@ -516,8 +548,11 @@ export default function fnxbus(pi: ExtensionAPI) {
 				});
 			}
 			pendingInjected.clear();
-			releaseLock(projectRoot, agent);
-			removeCard(projectRoot, agent);
+			// 只发不收的实例没占锁、没写名片。这里要是照删，删掉的是交互实例的
+			if (!sendOnly) {
+				releaseLock(projectRoot, agent);
+				removeCard(projectRoot, agent);
+			}
 			appendLog(projectRoot, { ts: Date.now(), event: "unregistered", from: agent });
 		}
 	});

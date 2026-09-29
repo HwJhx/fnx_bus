@@ -395,6 +395,110 @@ describe("消息丢失窗口（记录当前的取舍，不是主张它对）", (
 	});
 });
 
+/**
+ * 没有 UI（`-p`）只发不收，所以不占单实例锁、不写名片。
+ *
+ * 原来它照样抢锁：交互模式的同名 agent 开着时，`-p` 接不上总线、连消息都发不出；
+ * `-p` 跑着的时候交互模式也起不来。测试里同一进程的 pid 相同、锁永远不冲突，所以用
+ * 父进程的 pid（活着、又不是自己）假造「另一个进程里的交互实例」。
+ */
+describe("-p 只发不收：不占锁、不写名片", () => {
+	const lockPath = () => join(root, ".fnxbus", "locks", "fnx_sw.lock");
+	const cardPath = () => join(root, ".fnxbus", "agents", "fnx_sw.json");
+	/** 假造一个在别的进程里跑着的交互实例：锁和名片都是它的。 */
+	const otherInstanceRunning = (): { lock: string; card: string } => {
+		const lock = String(process.ppid);
+		const card = JSON.stringify({ agent: "fnx_sw", instance: `fnx_sw#${process.ppid}`, pid: process.ppid });
+		mkdirSync(join(root, ".fnxbus", "locks"), { recursive: true });
+		mkdirSync(join(root, ".fnxbus", "agents"), { recursive: true });
+		writeFileSync(lockPath(), lock, "utf8");
+		writeFileSync(cardPath(), card, "utf8");
+		return { lock, card };
+	};
+	const inboxOf = (role: string): string[] => {
+		const dir = join(root, ".fnxbus", "inbox", role);
+		return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
+	};
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("同名交互实例开着时，-p 照样接上总线、能发消息", async () => {
+		initProject();
+		otherInstanceRunning();
+
+		const p = boot({ hasUI: false });
+		const tool = p.tools.get("bus_send");
+		if (tool === undefined) throw new Error("bus_send 没注册");
+		const r = await tool.execute("c1", { to: "fnx_dv", type: "build_failed", text: "脚本跑完通知一声" });
+
+		expect(stderrWrites.join("")).not.toContain("已经有一个实例在运行");
+		expect(r.isError).toBeFalsy();
+		expect(inboxOf("fnx_dv")).toHaveLength(1);
+
+		p.fire("session_shutdown");
+	});
+
+	it("-p 退出时不删交互实例的锁和名片", () => {
+		initProject();
+		const other = otherInstanceRunning();
+
+		const p = boot({ hasUI: false });
+		p.fire("session_shutdown");
+
+		expect(readFileSync(lockPath(), "utf8")).toBe(other.lock);
+		expect(readFileSync(cardPath(), "utf8")).toBe(other.card);
+	});
+
+	it("-p 自己不占锁、不写名片：它跑着的时候交互实例照样起得来", () => {
+		initProject();
+
+		const p = boot({ hasUI: false });
+		expect(existsSync(lockPath())).toBe(false);
+		expect(existsSync(cardPath())).toBe(false);
+
+		const interactive = boot();
+		expect(interactive.status.get("fnxbus")).toBe("🚌 fnx_sw");
+		expect(existsSync(lockPath())).toBe(true);
+
+		interactive.fire("session_shutdown");
+		p.fire("session_shutdown");
+	});
+
+	it("交互实例照旧占锁：两个交互实例还是只能起一个", () => {
+		initProject();
+		otherInstanceRunning();
+
+		const second = boot();
+
+		expect(stderrWrites.join("")).toContain("已经有一个实例在运行");
+		expect(second.status.get("fnxbus")).toBe("🚌✗ 未接入");
+	});
+
+	it("对方回复 -p 发的消息，交互实例收到时不误报「对不上号」", async () => {
+		vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+		initProject();
+		const interactive = boot(); // 先起：它启动时读的 sent/ 里还没有 -p 那条
+
+		const p = boot({ hasUI: false });
+		const tool = p.tools.get("bus_send");
+		if (tool === undefined) throw new Error("bus_send 没注册");
+		const sent = await tool.execute("c1", { to: "fnx_dv", type: "build_failed", text: "编译挂了" });
+		const sentId = (sent.details as { id: string }).id;
+		p.fire("session_shutdown");
+
+		putInbox("01REPLYTOP01", { reply_to: sentId, thread_id: sentId, type: "need_input" });
+		vi.advanceTimersByTime(5000); // 触发一次轮询 drain
+
+		expect(interactive.delivered).toHaveLength(1);
+		expect(interactive.delivered[0].content).toContain(`这是对你 ${sentId} 那条的回复`);
+		expect(interactive.delivered[0].content).not.toContain("本机没有发出过那条消息");
+
+		interactive.fire("session_shutdown");
+	});
+});
+
 describe("起不来的时候要说清原因", () => {
 	it("没有角色表：不注册、状态栏标未接入、notify 给出出路", () => {
 		const bus = join(root, ".fnxbus");
